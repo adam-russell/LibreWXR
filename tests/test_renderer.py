@@ -1165,4 +1165,5 @@ class TestPresentationShortcuts:
         actual = present_tile(geom, scheme, fmt, luts=supplied_luts)
         assert actual == expected_bytes
         mixed = mask is not None and mask.any() and not mask.all()
-        assert lookup.call_count == (2 if mixed else 1)
+        # Mixed masks gather directly from the combined rain/snow table.
+        assert lookup.call_count == (0 if mixed else 1)

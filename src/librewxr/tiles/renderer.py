@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
-from librewxr.colors.schemes import colorize, colorize_with_lut
+from librewxr.colors.schemes import colorize, colorize_with_lut, get_lut
 from librewxr.config import settings
 from librewxr.data.coverage import sample_coverage, sample_feather
 from librewxr.data.regions import RegionDef
@@ -392,13 +392,14 @@ def present_tile(
             else:
                 rgba = colorize(geom.values, color_scheme, snow=True)
         else:
-            if luts is not None:
-                rgba_rain = colorize_with_lut(geom.values, luts[0])
-                rgba_snow = colorize_with_lut(geom.values, luts[1])
+            if luts is None:
+                rain_lut = get_lut(color_scheme, snow=False)
+                snow_lut = get_lut(color_scheme, snow=True)
             else:
-                rgba_rain = colorize(geom.values, color_scheme, snow=False)
-                rgba_snow = colorize(geom.values, color_scheme, snow=True)
-            rgba = np.where(geom.snow_mask[..., np.newaxis], rgba_snow, rgba_rain)
+                rain_lut, snow_lut = luts
+            # Use indices 256..511 for snow; uint16 prevents uint8 overflow.
+            indices = geom.values + geom.snow_mask.astype(np.uint16) * 256
+            rgba = np.take(np.concatenate((rain_lut, snow_lut)), indices, axis=0)
     elif luts is not None:
         rgba = colorize_with_lut(geom.values, luts[0])
     else:

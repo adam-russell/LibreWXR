@@ -639,6 +639,11 @@ def _composite_regions(
             region.name, tile_lats, tile_lons
         )
         claimed |= region_coverage
+        # Include the smoothing padding in the coverage check. Once every
+        # pixel is claimed, lower-priority sources cannot change the result,
+        # even where the authoritative source reports no precipitation.
+        if claimed.all():
+            break
 
     return values
 

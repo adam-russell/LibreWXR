@@ -9,9 +9,10 @@ the PNG and converting back to RGBA reproduces the input pixels bit-for-bit,
 including full 8-bit alpha via the tRNS chunk.  Everything else keeps the
 plain 32-bit RGBA encoding.
 
-The palette path must stay numpy-only on the hot path: the only Python
-lists built here are the <=256-entry palette / transparency arrays, which
-are negligible next to the pixel counting work.
+Keep per-pixel work in NumPy or Pillow's native implementation;
+never build Python lists containing every pixel. The preliminary
+color probe returns at most 256 entries, and exact palette mapping
+remains NumPy-based.
 """
 import io
 
@@ -36,6 +37,13 @@ def encode_png(img: Image.Image) -> bytes:
     previous 32-bit RGBA encoding.  Output is byte-for-byte deterministic
     for identical input.
     """
+    # Stop counting as soon as the image exceeds the palette limit. This
+    # avoids packing and sorting every pixel of detailed/smoothed tiles.
+    # Single-color images also keep the existing plain-RGBA encoding.
+    colors = img.getcolors(maxcolors=256)
+    if colors is None or len(colors) < _PALETTE_MIN_COLORS:
+        return _encode_rgba_png(img)
+
     arr = np.asarray(img)
     packed = (
         (arr[..., 0].astype(np.uint32) << 24)
@@ -60,8 +68,12 @@ def encode_png(img: Image.Image) -> bytes:
         buf = io.BytesIO()
         out.save(buf, format="PNG", optimize=True, compress_level=6)
         return buf.getvalue()
-    # 1 color, or more than 256 unique colors: plain 32-bit RGBA (the
-    # previous PNG encoding).  Level 6, not 1: Pillow wheels link the host
+    return _encode_rgba_png(img)
+
+
+def _encode_rgba_png(img: Image.Image) -> bytes:
+    # Plain 32-bit RGBA, unchanged from the previous encoder.
+    # Level 6, not 1: Pillow wheels link the host
     # libz (stock zlib on Debian, zlib-ng on Fedora) and the two diverge up
     # to ~4x in level-1 output size; level 6 converges and the palette path
     # already uses 6.

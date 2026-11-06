@@ -15,7 +15,7 @@ from librewxr.colors.schemes import (
     capture_luts,
     packaged_table_bytes,
 )
-from librewxr.data.regions import REGIONS
+from librewxr.data.regions import REGIONS, RegionDef
 from librewxr.tiles.cache import TileCache
 from librewxr.tiles.coordinates import (
     COMPOSITE_HEIGHT,
@@ -323,6 +323,31 @@ class TestAdaptivePalettePng:
         geom = TileGeometry.transparent(256)
         png = present_tile(geom, color_scheme=2, fmt="png")
         assert len(png) < 600
+
+    @pytest.mark.parametrize("count", [1, 2, 255, 256, 257, 512])
+    def test_palette_boundary_and_transparency(self, count, monkeypatch):
+        img = self._banded_img(count)
+        if count == 1 or count > 256:
+            def unexpected_sort(*args, **kwargs):
+                pytest.fail("Plain RGBA tiles must not perform numpy color sorting")
+            monkeypatch.setattr(np, "unique", unexpected_sort)
+        encoded = encode_png(img)
+        decoded = Image.open(io.BytesIO(encoded))
+        assert decoded.mode == ("P" if 2 <= count <= 256 else "RGBA")
+        np.testing.assert_array_equal(np.asarray(decoded.convert("RGBA")), np.asarray(img))
+        if count == 1 or count > 256:
+            # Keep the existing bytes/ETags, not just the decoded pixels.
+            original = io.BytesIO()
+            img.save(original, format="PNG", optimize=False, compress_level=6)
+            assert encoded == original.getvalue()
+
+    def test_probe_counts_alpha_as_part_of_color(self):
+        pixels = np.full((16, 16, 4), 80, dtype=np.uint8)
+        pixels[:, :, 3] = np.arange(256, dtype=np.uint8).reshape(16, 16)
+        img = Image.fromarray(pixels)
+        decoded = Image.open(io.BytesIO(encode_png(img)))
+        assert decoded.mode == "P"
+        np.testing.assert_array_equal(np.asarray(decoded.convert("RGBA")), pixels)
 
 
 class TestBlurRadius:
@@ -1013,3 +1038,62 @@ class TestPresentTileCapturedLuts:
         after = present_tile(geom, color_scheme=2, fmt="png")
 
         assert before == after
+
+
+class TestCompositeRegionCoverage:
+    """Skip lower-priority sources only after all padded pixels are covered."""
+
+    @pytest.mark.parametrize("smooth", [False, True])
+    @pytest.mark.parametrize("pad", [0, 3])
+    @pytest.mark.parametrize("case", ["wet", "dry", "partial", "union", "missing", "padding"])
+    def test_preserves_authoritative_coverage(self, monkeypatch, smooth, pad, case):
+        from librewxr.config import settings
+        from librewxr.tiles import renderer as renderer_mod
+
+        monkeypatch.setattr(settings, "coord_store_enabled", False)
+        size = 32
+        shape = (size + 2 * pad, size + 2 * pad)
+        regions = [
+            RegionDef(name, -180, 180, -85, 85, 1, "TEST")
+            for name in ("fine", "coarse", "global")
+        ]
+        frames = {
+            r.name: np.full((r.height, r.width), value, dtype=np.uint8)
+            for r, value in zip(regions, (0 if case == "dry" else 120, 200, 240))
+        }
+        coverage = {r.name: np.ones(shape, dtype=bool) for r in regions}
+        expected = np.full(shape, 0 if case == "dry" else 120, dtype=np.uint8)
+        expected_sources = ["fine"]
+        if case in ("partial", "union"):
+            coverage["fine"][:, shape[1] // 2:] = False
+            if case == "union":
+                coverage["coarse"][:, :shape[1] // 2] = False
+            expected[:, shape[1] // 2:] = 200
+            expected_sources.append("coarse")
+        elif case == "missing":
+            del frames["fine"]
+            expected[:] = 200
+            expected_sources = ["coarse"]
+        elif case == "padding" and pad:
+            coverage["fine"][:] = False
+            coverage["fine"][pad:-pad, pad:-pad] = True
+            expected[~coverage["fine"]] = 200
+            expected_sources.append("coarse")
+
+        coverage_calls = []
+
+        def sample_coverage(name, lat, lon):
+            assert lat.shape == lon.shape == shape
+            coverage_calls.append(name)
+            return coverage[name]
+
+        monkeypatch.setattr(renderer_mod, "sample_coverage", sample_coverage)
+        sampler_name = "_bilinear_sample" if smooth else "_gather_clipped"
+        sampler = MagicMock(wraps=getattr(renderer_mod, sampler_name))
+        monkeypatch.setattr(renderer_mod, sampler_name, sampler)
+        result = renderer_mod._composite_regions(
+            frames, regions, 4, 4, 6, size, smooth, bool(pad), pad,
+        )
+        np.testing.assert_array_equal(result, expected)
+        assert coverage_calls == expected_sources
+        assert sampler.call_count == len(expected_sources)

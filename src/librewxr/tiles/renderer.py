@@ -383,14 +383,22 @@ def present_tile(
     if geom.is_transparent:
         return _transparent_tile(geom.tile_size, fmt)
 
-    if geom.snow_mask is not None:
-        if luts is not None:
-            rgba_rain = colorize_with_lut(geom.values, luts[0])
-            rgba_snow = colorize_with_lut(geom.values, luts[1])
+    # Uniform masks need only one LUT lookup and no full-image selection.
+    # Inspect the padded mask, and leave cached geometry untouched.
+    if geom.snow_mask is not None and geom.snow_mask.any():
+        if geom.snow_mask.all():
+            if luts is not None:
+                rgba = colorize_with_lut(geom.values, luts[1])
+            else:
+                rgba = colorize(geom.values, color_scheme, snow=True)
         else:
-            rgba_rain = colorize(geom.values, color_scheme, snow=False)
-            rgba_snow = colorize(geom.values, color_scheme, snow=True)
-        rgba = np.where(geom.snow_mask[..., np.newaxis], rgba_snow, rgba_rain)
+            if luts is not None:
+                rgba_rain = colorize_with_lut(geom.values, luts[0])
+                rgba_snow = colorize_with_lut(geom.values, luts[1])
+            else:
+                rgba_rain = colorize(geom.values, color_scheme, snow=False)
+                rgba_snow = colorize(geom.values, color_scheme, snow=True)
+            rgba = np.where(geom.snow_mask[..., np.newaxis], rgba_snow, rgba_rain)
     elif luts is not None:
         rgba = colorize_with_lut(geom.values, luts[0])
     else:
@@ -399,12 +407,9 @@ def present_tile(
     img = Image.fromarray(rgba, "RGBA")
 
     if geom.blur_radius >= 0.5:
-        r, g, b, a = img.split()
-        rgb = Image.merge("RGB", (r, g, b))
-        rgb = rgb.filter(ImageFilter.GaussianBlur(radius=geom.blur_radius))
-        a = a.filter(ImageFilter.GaussianBlur(radius=geom.blur_radius))
-        r, g, b = rgb.split()
-        img = Image.merge("RGBA", (r, g, b, a))
+        # GaussianBlur filters each RGBA channel independently, preserving
+        # the separate RGB/alpha result without splitting and merging bands.
+        img = img.filter(ImageFilter.GaussianBlur(radius=geom.blur_radius))
 
         if geom.pad > 0:
             img = img.crop(

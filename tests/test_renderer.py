@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageFilter
 
 pytestmark = pytest.mark.tiles
 
@@ -1097,3 +1097,72 @@ class TestCompositeRegionCoverage:
         np.testing.assert_array_equal(result, expected)
         assert coverage_calls == expected_sources
         assert sampler.call_count == len(expected_sources)
+
+
+class TestPresentationShortcuts:
+    """Preserve the original color/alpha/blur output while avoiding copies."""
+
+    @pytest.mark.parametrize("mask_kind", ["none", "rain", "snow", "mixed", "snow_in_padding"])
+    @pytest.mark.parametrize("scheme,captured", [(6, False), (7, False), (6, True)])
+    @pytest.mark.parametrize("radius,pad", [(0.0, 0), (0.49, 0), (0.5, 2), (6.36, 20)])
+    @pytest.mark.parametrize("fmt", ["png", "webp"])
+    def test_matches_original_presentation(
+        self, monkeypatch, mask_kind, scheme, captured, radius, pad, fmt,
+    ):
+        from librewxr.tiles import renderer as renderer_mod
+
+        rng = np.random.default_rng(42)
+        size = 32
+        shape = (size + 2 * pad, size + 2 * pad)
+        values = rng.integers(0, 256, shape, dtype=np.uint8)
+        if mask_kind == "none":
+            mask = None
+        elif mask_kind == "mixed":
+            mask = rng.random(shape) > 0.5
+        elif mask_kind == "snow_in_padding":
+            mask = np.ones(shape, dtype=bool)
+            mask[pad:pad + size, pad:pad + size] = False
+        else:
+            mask = np.full(shape, mask_kind == "snow", dtype=bool)
+        if captured:
+            # Deliberately differ from the global scheme; include transparent
+            # pixels with nonzero RGB and partial alpha in both captured LUTs.
+            rain_lut = rng.integers(0, 256, (256, 4), dtype=np.uint8)
+            snow_lut = rng.integers(0, 256, (256, 4), dtype=np.uint8)
+            rain_lut[::3, 3] = 0
+            snow_lut[::3, 3] = 0
+        else:
+            rain_lut, snow_lut, _version = capture_luts(scheme)
+            rain_lut, snow_lut = rain_lut.copy(), snow_lut.copy()
+        supplied_luts = (rain_lut, snow_lut) if captured else None
+
+        # Reference the pre-optimization pipeline: colorize both masks and
+        # blur RGB and alpha separately before cropping and encoding.
+        rgba = rain_lut[values]
+        if mask is not None:
+            rgba = np.where(mask[..., np.newaxis], snow_lut[values], rgba)
+        expected = Image.fromarray(rgba, "RGBA")
+        if radius >= 0.5:
+            red, green, blue, alpha = expected.split()
+            rgb = Image.merge("RGB", (red, green, blue))
+            rgb = rgb.filter(ImageFilter.GaussianBlur(radius))
+            alpha = alpha.filter(ImageFilter.GaussianBlur(radius))
+            expected = Image.merge("RGBA", (*rgb.split(), alpha))
+            if pad:
+                expected = expected.crop((pad, pad, pad + size, pad + size))
+        expected_bytes = renderer_mod._encode_image(expected, fmt)
+
+        # Cached inputs must remain reusable for other schemes/requests.
+        values.flags.writeable = False
+        if mask is not None:
+            mask.flags.writeable = False
+        rain_lut.flags.writeable = False
+        snow_lut.flags.writeable = False
+        lookup_name = "colorize_with_lut" if captured else "colorize"
+        lookup = MagicMock(wraps=getattr(renderer_mod, lookup_name))
+        monkeypatch.setattr(renderer_mod, lookup_name, lookup)
+        geom = TileGeometry(values, mask, size, pad, radius)
+        actual = present_tile(geom, scheme, fmt, luts=supplied_luts)
+        assert actual == expected_bytes
+        mixed = mask is not None and mask.any() and not mask.all()
+        assert lookup.call_count == (2 if mixed else 1)

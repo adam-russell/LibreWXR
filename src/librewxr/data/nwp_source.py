@@ -119,7 +119,7 @@ class NWPChain:
     ) -> np.ndarray:
         out = np.zeros(lat.shape, dtype=np.float32)
         remaining = np.ones(lat.shape, dtype=np.float32)
-        for src in self._sources:
+        for index, src in enumerate(self._sources):
             if not (remaining > 0.0).any():
                 break
             if timestamp is not None and not src.has_data_at(timestamp):
@@ -127,6 +127,10 @@ class NWPChain:
             if timestamp is None and not src.has_data():
                 continue
             feather = src.feather_mask(lat, lon).astype(np.float32, copy=False)
+            # Full weight from the first source needs no blend. Keep the
+            # result independently writable, even if the source returns a view.
+            if index == 0 and (feather == 1.0).all():
+                return src.sample(lat, lon, timestamp, bilinear).copy()
             weight = remaining * feather
             relevant = weight > 0.0
             if not relevant.any():
@@ -153,7 +157,7 @@ class NWPChain:
     ) -> np.ndarray:
         out = np.zeros(lat.shape, dtype=bool)
         unfilled = np.ones(lat.shape, dtype=bool)
-        for src in self._sources:
+        for index, src in enumerate(self._sources):
             if not unfilled.any():
                 break
             if not src.supports_snow:
@@ -163,6 +167,10 @@ class NWPChain:
             if timestamp is None and not src.has_data():
                 continue
             domain = src.domain_mask(lat, lon)
+            # The first source owns every pixel, including authoritative rain.
+            # Copy so callers cannot mutate the source's cached classification.
+            if index == 0 and domain.all():
+                return src.get_snow_mask(lat, lon, timestamp).copy()
             mask = unfilled & domain
             if not mask.any():
                 continue

@@ -248,6 +248,21 @@ class TestAdaptivePalettePng:
             assert out.mode == "RGBA"
         assert np.array_equal(np.asarray(out.convert("RGBA")), np.asarray(img))
 
+    def test_palette_preserves_rgba_sort_order_and_bytes(self):
+        """Probe order must not change PNG bytes or transparent RGB colors."""
+        colors = np.array([
+            (0, 0, 0, 0), (0, 0, 0, 255), (0, 0, 1, 0),
+            (0, 1, 0, 0), (1, 0, 0, 0), (255, 255, 255, 255),
+        ], dtype=np.uint8)
+        indices = np.array([[5, 4, 3, 2, 1, 0], [0, 1, 2, 3, 4, 5]], dtype=np.uint8)
+        img = Image.fromarray(colors[indices], "RGBA")
+        expected = Image.fromarray(indices, "P")
+        expected.putpalette(colors[:, :3].ravel().tolist())
+        expected.info["transparency"] = bytes(colors[:, 3].tolist())
+        buf = io.BytesIO()
+        expected.save(buf, format="PNG", optimize=True, compress_level=6)
+        assert encode_png(img) == buf.getvalue()
+
     def test_forty_colors_round_trips(self):
         """~40 colors -> palette path, bit-exact round trip."""
         img = self._banded_img(40)

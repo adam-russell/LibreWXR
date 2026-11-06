@@ -400,9 +400,16 @@ class TestCaptureLuts:
 
 
 class TestColorizeWithLut:
-    def test_pure_gather_matches_colorize(self):
-        values = np.array([[0, 64, 255]], dtype=np.uint8)
-        lut = get_lut(3)
-        np.testing.assert_array_equal(
-            colorize_with_lut(values, lut), colorize(values, 3),
-        )
+    @pytest.mark.parametrize("layout", ["contiguous", "strided", "reversed"])
+    def test_pure_gather_matches_colorize(self, layout):
+        values = np.arange(256, dtype=np.uint8).reshape(16, 16)
+        if layout == "strided":
+            values = values[::2, 1::2]
+        elif layout == "reversed":
+            values = values[::-1, ::-1]
+        lut = get_lut(3).copy()
+        values.flags.writeable = False
+        lut.flags.writeable = False
+        expected = lut[values]
+        np.testing.assert_array_equal(colorize_with_lut(values, lut), expected)
+        np.testing.assert_array_equal(colorize(values, 3), expected)

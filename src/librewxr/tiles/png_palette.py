@@ -51,9 +51,13 @@ def encode_png(img: Image.Image) -> bytes:
         | (arr[..., 2].astype(np.uint32) << 8)
         | arr[..., 3].astype(np.uint32)
     )
-    # ``np.unique`` sorts, which makes the palette order (and therefore the
-    # encoded bytes) deterministic for a given input image.
-    uniq, inverse = np.unique(packed.ravel(), return_inverse=True)
+    # Reuse the bounded color probe and preserve the existing sorted palette.
+    # Only the palette is sorted; map pixels to it with a vectorized search.
+    uniq = np.array(sorted(
+        (r << 24) | (g << 16) | (b << 8) | a
+        for _, (r, g, b, a) in colors
+    ), dtype=np.uint32)
+    inverse = np.searchsorted(uniq, packed.ravel())
     n_colors = len(uniq)
     if _PALETTE_MIN_COLORS <= n_colors <= 256:
         idx = inverse.reshape(arr.shape[:2]).astype(np.uint8)

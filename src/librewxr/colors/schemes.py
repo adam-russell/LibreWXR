@@ -287,7 +287,7 @@ def colorize_with_lut(values: np.ndarray, lut: np.ndarray) -> np.ndarray:
     ``lut`` is a (256, 4) uint8 RGBA table, so the result has shape
     ``(*values.shape, 4)``.
     """
-    return lut[values]
+    return np.take(lut, values, axis=0)
 
 
 def colorize(values: np.ndarray, scheme: int, snow: bool = False) -> np.ndarray:

@@ -76,6 +76,9 @@ _MSC_CANADA_PALETTE: tuple[tuple[int, int, int, float], ...] = (
 # unexpected color and is treated as no-data.
 _MSC_CANADA_MAX_RGB_DIST = 8.0
 
+# Bound the (pixels, palette, RGB) distance buffers independently of image size.
+_MSC_CANADA_DECODE_CHUNK_PIXELS = 65536
+
 
 def _mmhr_to_dbz(rate: np.ndarray) -> np.ndarray:
     """Convert precipitation rate (mm/h) to reflectivity (dBZ).
@@ -108,12 +111,8 @@ def _decode_msc_canada_png(data: bytes) -> np.ndarray | None:
         return None
 
     h, w = arr.shape[:2]
-    # int32 — per-channel squared diffs can reach ~65k and we sum three of
-    # them, which overflows int16.
-    rgb = arr[..., :3].astype(np.int32)
-    alpha = arr[..., 3]
-
-    # Build palette arrays: shape (N, 3) for colors, (N,) for rates
+    pixels = arr.reshape(-1, 4)
+    out = np.empty(len(pixels), dtype=np.uint8)
     anchors_rgb = np.array(
         [(r, g, b) for r, g, b, _ in _MSC_CANADA_PALETTE], dtype=np.int32
     )
@@ -121,33 +120,27 @@ def _decode_msc_canada_png(data: bytes) -> np.ndarray | None:
         [rate for *_, rate in _MSC_CANADA_PALETTE], dtype=np.float32
     )
 
-    # Flatten pixels for vectorized nearest-anchor lookup
-    flat = rgb.reshape(-1, 3)  # (H*W, 3)
+    # Keep the original per-pixel distance and conversion calculations, but
+    # materialize their large palette-axis buffers only for a bounded block.
+    for start in range(0, len(pixels), _MSC_CANADA_DECODE_CHUNK_PIXELS):
+        block = pixels[start:start + _MSC_CANADA_DECODE_CHUNK_PIXELS]
+        # Squared RGB distances overflow int16; retain int32 differences
+        # and NumPy's original sum dtype and first-minimum tie-breaking.
+        rgb = block[:, :3].astype(np.int32)
+        diffs = rgb[:, None, :] - anchors_rgb[None, :, :]
+        dist2 = np.sum(diffs * diffs, axis=2)
+        nearest_idx = np.argmin(dist2, axis=1)
+        nearest_dist2 = dist2[np.arange(len(block)), nearest_idx]
+        rate = anchors_rate[nearest_idx]
+        valid = (block[:, 3] > 0) & (
+            nearest_dist2 <= _MSC_CANADA_MAX_RGB_DIST ** 2
+        )
+        rate = np.where(valid, rate, np.nan)
+        dbz = _mmhr_to_dbz(rate)
+        dbz = np.where(np.isnan(dbz), -33.0, dbz)
+        out[start:start + len(block)] = _dbz_float_to_uint8(dbz)
 
-    # Squared distance from each pixel to each anchor: (H*W, N)
-    # Using broadcasting: (H*W, 1, 3) - (1, N, 3) → (H*W, N, 3)
-    diffs = flat[:, None, :] - anchors_rgb[None, :, :]
-    dist2 = np.sum(diffs * diffs, axis=2)  # (H*W, N)
-
-    nearest_idx = np.argmin(dist2, axis=1)  # (H*W,)
-    nearest_dist2 = dist2[np.arange(len(flat)), nearest_idx]
-
-    # Map nearest index → mm/h rate
-    rate_flat = anchors_rate[nearest_idx]  # (H*W,)
-
-    # Mask out: transparent pixels, or pixels too far from any anchor
-    valid = (alpha.reshape(-1) > 0) & (
-        nearest_dist2 <= _MSC_CANADA_MAX_RGB_DIST ** 2
-    )
-    rate_flat = np.where(valid, rate_flat, np.nan)
-
-    # Convert mm/h → dBZ
-    dbz_flat = _mmhr_to_dbz(rate_flat)
-    dbz = dbz_flat.reshape(h, w)
-
-    # NaN → -33 sentinel so the shared uint8 encoder maps it to 0
-    dbz = np.where(np.isnan(dbz), -33.0, dbz)
-    return _dbz_float_to_uint8(dbz)
+    return out.reshape(h, w)
 
 
 class MSCCanadaSource:

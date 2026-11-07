@@ -168,3 +168,97 @@ class TestCanadaTileOverlap:
         region = REGIONS["CACOMP"]
         # z=4, x=8, y=5 is over central Europe
         assert not tile_overlaps_region(region, z=4, x=8, y=5)
+
+
+def _scalar_palette_reference(rgba):
+    """Independent integer-distance oracle, without pixel/palette broadcasting."""
+    from librewxr.sources._helpers import _dbz_float_to_uint8
+    from librewxr.sources.regional.north_america.canada.radar.msc_canada import source
+
+    palette = source._MSC_CANADA_PALETTE
+    rates = np.array([row[3] for row in palette], dtype=np.float32)
+    codes = _dbz_float_to_uint8(_mmhr_to_dbz(rates))
+    result = np.zeros(rgba.shape[:2], dtype=np.uint8)
+    for y, x in np.ndindex(result.shape):
+        pixel = rgba[y, x]
+        if pixel[3] == 0:
+            continue
+        distances = [sum((int(pixel[c]) - anchor[c]) ** 2 for c in range(3)) for anchor in palette]
+        nearest = min(range(len(palette)), key=distances.__getitem__)
+        if distances[nearest] <= source._MSC_CANADA_MAX_RGB_DIST ** 2:
+            result[y, x] = codes[nearest]
+    return result
+
+
+def _save_test_png(image):
+    stream = io.BytesIO()
+    image.save(stream, format="PNG")
+    return stream.getvalue()
+
+
+class TestBoundedPaletteDecoder:
+    @pytest.mark.parametrize("shape", [(1, 1), (1, 6), (1, 7), (1, 8), (2, 7), (3, 5), (5, 3), (4, 4)])
+    def test_exact_output_across_pixel_block_boundaries(self, monkeypatch, shape):
+        from librewxr.sources.regional.north_america.canada.radar.msc_canada import source
+
+        monkeypatch.setattr(source, "_MSC_CANADA_DECODE_CHUNK_PIXELS", 7)
+        rng = np.random.default_rng(42)
+        count = shape[0] * shape[1]
+        anchors = np.array([row[:3] for row in _MSC_CANADA_PALETTE], dtype=np.int32)
+        colors = anchors[np.arange(count) % len(anchors)] + rng.integers(-9, 10, (count, 3))
+        pixels = np.empty((count, 4), dtype=np.uint8)
+        pixels[:, :3] = np.clip(colors, 0, 255)
+        pixels[:, 3] = np.resize([0, 1, 127, 255], count)
+        rgba = pixels.reshape(*shape, 4)
+        result = _decode_msc_canada_png(_save_test_png(Image.fromarray(rgba)))
+        np.testing.assert_array_equal(result, _scalar_palette_reference(rgba))
+        assert result.shape == shape
+        assert result.dtype == np.uint8
+
+    @pytest.mark.parametrize("mode", ["RGBA", "RGB", "P", "L"])
+    def test_png_modes_match_scalar_reference(self, mode):
+        pixels = [(r, g, b, [0, 1, 127, 255][i % 4])
+                  for i, (r, g, b, _) in enumerate(_MSC_CANADA_PALETTE * 2)]
+        image = Image.fromarray(np.array(pixels, dtype=np.uint8).reshape(4, 7, 4)).convert(mode)
+        png = _save_test_png(image)
+        rgba = np.asarray(Image.open(io.BytesIO(png)).convert("RGBA"))
+        np.testing.assert_array_equal(_decode_msc_canada_png(png), _scalar_palette_reference(rgba))
+
+    def test_distance_threshold_and_nonzero_alpha(self):
+        rgba = np.array([[(8, 152, 254, 255), (8, 153, 254, 255),
+                          (8, 152, 254, 0), (8, 152, 254, 1), (255, 255, 255, 255)]], dtype=np.uint8)
+        result = _decode_msc_canada_png(_save_test_png(Image.fromarray(rgba)))
+        assert result[0, 0] > 0  # Squared distance exactly 64 is accepted.
+        assert result[0, 1] == 0  # Squared distance 65 is rejected.
+        assert result[0, 2] == 0
+        assert result[0, 3] == result[0, 0]
+        assert result[0, 4] == 0
+
+    def test_equal_distances_choose_first_palette_entry(self, monkeypatch):
+        from librewxr.sources.regional.north_america.canada.radar.msc_canada import source
+
+        monkeypatch.setattr(source, "_MSC_CANADA_PALETTE", ((100, 100, 100, 1.4142), (102, 100, 100, 2.8284)))
+        rgba = np.array([[(101, 100, 100, 255), (100, 100, 100, 255), (102, 100, 100, 255)]], dtype=np.uint8)
+        result = _decode_msc_canada_png(_save_test_png(Image.fromarray(rgba)))
+        assert result[0, 0] == result[0, 1]
+        assert result[0, 0] != result[0, 2]
+        np.testing.assert_array_equal(result, _scalar_palette_reference(rgba))
+
+    def test_distance_workspaces_are_bounded(self, monkeypatch):
+        from librewxr.sources.regional.north_america.canada.radar.msc_canada import source
+
+        monkeypatch.setattr(source, "_MSC_CANADA_DECODE_CHUNK_PIXELS", 7)
+        pixels = [(r, g, b, 255) for r, g, b, _ in _MSC_CANADA_PALETTE * 2][:23]
+        rgba = np.array([pixels], dtype=np.uint8)
+        block_sizes = []
+        original_argmin = np.argmin
+
+        def argmin(distances, *args, **kwargs):
+            block_sizes.append(distances.shape[0])
+            assert distances.shape[0] <= 7
+            return original_argmin(distances, *args, **kwargs)
+
+        monkeypatch.setattr(source.np, "argmin", argmin)
+        result = _decode_msc_canada_png(_save_test_png(Image.fromarray(rgba)))
+        assert block_sizes == [7, 7, 7, 2]
+        np.testing.assert_array_equal(result, _scalar_palette_reference(rgba))

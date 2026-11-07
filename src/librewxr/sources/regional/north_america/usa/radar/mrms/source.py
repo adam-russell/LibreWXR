@@ -790,29 +790,29 @@ def _resample_mrms_to_region(
         maps.pad_top, maps.pad_bottom, maps.pad_left, maps.pad_right,
     )
 
-    # cv2.remap bilinear interpolation on the float32 source.  The maps
-    # carry coordinates in the padded array, so every sample lands
-    # in-bounds and the border mode is never involved.
-    resampled = _remap_striped(padded, maps)
-    nodata_interp = _remap_striped(padded_mask, maps)
-    resampled = np.where(nodata_interp > 0.5, -33.0, resampled)
-
-    return _dbz_float_to_uint8(resampled)
+    return _remap_and_encode_striped(padded, padded_mask, maps)
 
 
-def _remap_striped(data: np.ndarray, maps: _ResampleMaps) -> np.ndarray:
-    """Remap with bounded coordinate buffers and the original float precision.
+def _remap_and_encode_striped(
+    data: np.ndarray, nodata_mask: np.ndarray, maps: _ResampleMaps,
+) -> np.ndarray:
+    """Remap data and its mask, then encode each strip into the final uint8 grid.
 
-    Each strip uses the same coordinates as the former full-sized maps.
-    Only temporary maps are materialized; cached axes and source data stay
-    unchanged so other processing threads can reuse them.
+    Reuse each strip's float32 coordinate maps for both interpolations. Float
+    results stay bounded to 256 rows, preserving interpolation precision and
+    the majority-no-data threshold without full-sized float output buffers.
+    Cached axes and source arrays stay unchanged for other processing threads.
     """
     height, width = len(maps.map_y), len(maps.map_x)
-    out = np.empty((height, width), dtype=data.dtype)
+    out = np.empty((height, width), dtype=np.uint8)
     for start in range(0, height, 256):
         end = min(start + 256, height)
         shape = (end - start, width)
         map_x = np.broadcast_to(maps.map_x[None, :], shape).copy()
         map_y = np.broadcast_to(maps.map_y[start:end, None], shape).copy()
-        cv2.remap(data, map_x, map_y, cv2.INTER_LINEAR, dst=out[start:end])
+        # Coordinates include continuation padding, so border mode is unused.
+        resampled = cv2.remap(data, map_x, map_y, cv2.INTER_LINEAR)
+        nodata_interp = cv2.remap(nodata_mask, map_x, map_y, cv2.INTER_LINEAR)
+        resampled = np.where(nodata_interp > 0.5, -33.0, resampled)
+        out[start:end] = _dbz_float_to_uint8(resampled)
     return out

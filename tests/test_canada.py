@@ -262,3 +262,51 @@ class TestBoundedPaletteDecoder:
         result = _decode_msc_canada_png(_save_test_png(Image.fromarray(rgba)))
         assert block_sizes == [7, 7, 7, 2]
         np.testing.assert_array_equal(result, _scalar_palette_reference(rgba))
+
+
+    @pytest.mark.parametrize("alpha", [0, 1, 127, 255])
+    def test_uniform_alpha_skips_only_fully_transparent_pixels(self, monkeypatch, alpha):
+        from librewxr.sources.regional.north_america.canada.radar.msc_canada import source
+
+        monkeypatch.setattr(source, "_MSC_CANADA_DECODE_CHUNK_PIXELS", 7)
+        rgba = np.empty((3, 5, 4), dtype=np.uint8)
+        rgba[:, :, :3] = _MSC_CANADA_PALETTE[1][:3]
+        rgba[:, :, 3] = alpha
+        expected = _scalar_palette_reference(rgba)
+        sizes = []
+        original_argmin = np.argmin
+
+        def argmin(distances, *args, **kwargs):
+            sizes.append(distances.shape[0])
+            return original_argmin(distances, *args, **kwargs)
+
+        monkeypatch.setattr(source.np, "argmin", argmin)
+        result = _decode_msc_canada_png(_save_test_png(Image.fromarray(rgba)))
+        assert sizes == ([] if alpha == 0 else [7, 7, 1])
+        np.testing.assert_array_equal(result, expected)
+        assert bool(np.any(result)) == (alpha > 0)
+
+    def test_mixed_blocks_do_palette_work_only_for_visible_pixels(self, monkeypatch):
+        from librewxr.sources.regional.north_america.canada.radar.msc_canada import source
+
+        monkeypatch.setattr(source, "_MSC_CANADA_DECODE_CHUNK_PIXELS", 7)
+        rgba = np.empty((3, 7, 4), dtype=np.uint8)
+        pixels = rgba.reshape(-1, 4)
+        pixels[:, :3] = np.array([row[:3] for row in _MSC_CANADA_PALETTE * 2][:21])
+        pixels[:, 3] = 0
+        # An empty block, a mixed block, then a fully visible block; nonzero
+        # alpha at both sides of the boundary must be decoded and scattered.
+        pixels[7:14, 3] = [1, 0, 127, 0, 0, 0, 255]
+        pixels[14:, 3] = 255
+        expected = _scalar_palette_reference(rgba)
+        sizes = []
+        original_argmin = np.argmin
+
+        def argmin(distances, *args, **kwargs):
+            sizes.append(distances.shape[0])
+            return original_argmin(distances, *args, **kwargs)
+
+        monkeypatch.setattr(source.np, "argmin", argmin)
+        result = _decode_msc_canada_png(_save_test_png(Image.fromarray(rgba)))
+        assert sizes == [3, 7]
+        np.testing.assert_array_equal(result, expected)

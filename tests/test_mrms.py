@@ -325,14 +325,22 @@ class TestStripedMRMSRemap:
 
         rng = np.random.default_rng(42)
         data = rng.uniform(-33, 65, (37, 53)).astype(dtype)
-        data[rng.random(data.shape) < 0.1] = 0
+        nodata_mask = (rng.random(data.shape) < 0.1).astype(np.float32)
+        data[nodata_mask > 0] = 0
+        data[2, 2] = np.nan
         rows = np.linspace(-1.25, 38.75, height)
         cols = np.linspace(-0.75, 54.25, 79)
         maps = source._build_resample_maps(rows, cols, *data.shape)
         padded = source._pad_continuation(
             data, maps.pad_top, maps.pad_bottom, maps.pad_left, maps.pad_right,
         )
+        padded_mask = source._pad_continuation(
+            nodata_mask, maps.pad_top, maps.pad_bottom, maps.pad_left, maps.pad_right,
+        )
+        original_data = padded.copy()
+        original_mask = padded_mask.copy()
         padded.flags.writeable = False
+        padded_mask.flags.writeable = False
         maps.map_x.flags.writeable = False
         maps.map_y.flags.writeable = False
         # Independent reference: the original full-sized float32 maps.
@@ -340,9 +348,14 @@ class TestStripedMRMSRemap:
         map_x = np.broadcast_to((cols + maps.pad_left).astype(np.float32)[None, :], shape).copy()
         map_y = np.broadcast_to((rows + maps.pad_top).astype(np.float32)[:, None], shape).copy()
         expected = cv2.remap(padded, map_x, map_y, cv2.INTER_LINEAR)
-        result = source._remap_striped(padded, maps)
+        mask = cv2.remap(padded_mask, map_x, map_y, cv2.INTER_LINEAR)
+        with np.errstate(invalid="ignore"):
+            expected = _dbz_float_to_uint8(np.where(mask > 0.5, -33.0, expected))
+            result = source._remap_and_encode_striped(padded, padded_mask, maps)
+        np.testing.assert_array_equal(padded, original_data)
+        np.testing.assert_array_equal(padded_mask, original_mask)
         np.testing.assert_array_equal(result, expected)
-        assert result.dtype == dtype
+        assert result.dtype == np.uint8
         assert not np.shares_memory(result, padded)
 
     def test_cache_retains_axes_instead_of_destination_grids(self):
@@ -355,3 +368,38 @@ class TestStripedMRMSRemap:
         assert maps.map_y.shape == (5400,)
         assert maps.map_x.dtype == maps.map_y.dtype == np.float32
         assert maps.map_x.nbytes + maps.map_y.nbytes == (12200 + 5400) * 4
+
+    def test_majority_nodata_threshold_is_strict(self):
+        from librewxr.sources.regional.north_america.usa.radar.mrms import source
+
+        data = np.full((2, 4), 30, dtype=np.float32)
+        mask = np.tile(np.array([0, 0.5, 0.5001, 1], dtype=np.float32), (2, 1))
+        maps = source._build_resample_maps(np.arange(2.), np.arange(4.), 2, 4)
+        result = source._remap_and_encode_striped(data, mask, maps)
+        np.testing.assert_array_equal(result, [[124, 124, 0, 0], [124, 124, 0, 0]])
+
+    def test_float_workspaces_are_bounded_to_a_strip(self, monkeypatch):
+        from librewxr.sources.regional.north_america.usa.radar.mrms import source
+
+        data = np.full((513, 9), 30, dtype=np.float32)
+        mask = np.zeros_like(data)
+        maps = source._build_resample_maps(np.arange(513.), np.arange(9.), *data.shape)
+        remap_shapes, encode_shapes = [], []
+        original_remap = source.cv2.remap
+        original_encode = source._dbz_float_to_uint8
+
+        def remap(array, map_x, map_y, *args, **kwargs):
+            assert map_x.shape == map_y.shape
+            remap_shapes.append(map_x.shape)
+            return original_remap(array, map_x, map_y, *args, **kwargs)
+
+        def encode(array):
+            encode_shapes.append(array.shape)
+            return original_encode(array)
+
+        monkeypatch.setattr(source.cv2, "remap", remap)
+        monkeypatch.setattr(source, "_dbz_float_to_uint8", encode)
+        result = source._remap_and_encode_striped(data, mask, maps)
+        assert remap_shapes == [(256, 9)] * 4 + [(1, 9)] * 2
+        assert encode_shapes == [(256, 9), (256, 9), (1, 9)]
+        np.testing.assert_array_equal(result, np.full(data.shape, 124, dtype=np.uint8))

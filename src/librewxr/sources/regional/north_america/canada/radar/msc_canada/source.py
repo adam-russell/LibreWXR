@@ -98,7 +98,7 @@ def _decode_msc_canada_png(data: bytes) -> np.ndarray | None:
 
     Steps:
     1. Open as RGBA (transparent pixels → no-data).
-    2. For each opaque pixel, find the nearest palette anchor in RGB
+    2. For each pixel with nonzero alpha, find the nearest palette anchor in RGB
        space.  Pixels beyond the distance threshold become no-data.
     3. Convert anchor mm/h values to dBZ via Marshall-Palmer.
     4. Encode to uint8 using the shared scheme: (dBZ + 32) * 2, clamped.
@@ -112,7 +112,7 @@ def _decode_msc_canada_png(data: bytes) -> np.ndarray | None:
 
     h, w = arr.shape[:2]
     pixels = arr.reshape(-1, 4)
-    out = np.empty(len(pixels), dtype=np.uint8)
+    out = np.zeros(len(pixels), dtype=np.uint8)
     anchors_rgb = np.array(
         [(r, g, b) for r, g, b, _ in _MSC_CANADA_PALETTE], dtype=np.int32
     )
@@ -126,19 +126,30 @@ def _decode_msc_canada_png(data: bytes) -> np.ndarray | None:
         block = pixels[start:start + _MSC_CANADA_DECODE_CHUNK_PIXELS]
         # Squared RGB distances overflow int16; retain int32 differences
         # and NumPy's original sum dtype and first-minimum tie-breaking.
-        rgb = block[:, :3].astype(np.int32)
+        # Transparent output is already zero; skip its palette work entirely.
+        visible = block[:, 3] > 0
+        if not np.any(visible):
+            continue
+        all_visible = bool(np.all(visible))
+        # Avoid a selection copy for fully visible blocks.
+        block_visible = block if all_visible else block[visible]
+        rgb = block_visible[:, :3].astype(np.int32)
         diffs = rgb[:, None, :] - anchors_rgb[None, :, :]
         dist2 = np.sum(diffs * diffs, axis=2)
         nearest_idx = np.argmin(dist2, axis=1)
-        nearest_dist2 = dist2[np.arange(len(block)), nearest_idx]
+        nearest_dist2 = dist2[np.arange(len(block_visible)), nearest_idx]
         rate = anchors_rate[nearest_idx]
-        valid = (block[:, 3] > 0) & (
+        valid = (block_visible[:, 3] > 0) & (
             nearest_dist2 <= _MSC_CANADA_MAX_RGB_DIST ** 2
         )
         rate = np.where(valid, rate, np.nan)
         dbz = _mmhr_to_dbz(rate)
         dbz = np.where(np.isnan(dbz), -33.0, dbz)
-        out[start:start + len(block)] = _dbz_float_to_uint8(dbz)
+        encoded = _dbz_float_to_uint8(dbz)
+        if all_visible:
+            out[start:start + len(block)] = encoded
+        else:
+            out[start:start + len(block)][visible] = encoded
 
     return out.reshape(h, w)
 

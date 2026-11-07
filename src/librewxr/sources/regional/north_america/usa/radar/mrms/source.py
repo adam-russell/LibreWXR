@@ -70,22 +70,19 @@ _DECODED_LOCK_MAX = 16
 # ---------------------------------------------------------------------------
 # cv2.remap index-grid cache (Work item 1)
 #
-# The resample used to materialize ~12 full target-shaped float32 arrays per
-# frame (dr/dc, four weight products, four corner gathers, resampled,
-# nodata_mask, nodata_interp) — for USCOMP (12200x5400) that is a ~2.5 GB
-# transient.  cv2.remap does the same bilinear gather in C with small
-# per-row buffers; its map_x/map_y index grids are deterministic per
-# (cropped source grid shape, region name), so they are built once and
-# cached instead of per frame (~2 x 263 MB for USCOMP).  The pad depths that
-# reproduce the legacy clipped-index corner handling are stored alongside.
+# cv2.remap performs bilinear sampling in C. Its coordinates are separable,
+# so cache only the float32 X/Y axes, then materialize maps for a small strip
+# at a time. This avoids retaining two full destination-sized grids (~503 MiB
+# for USCOMP) without changing coordinate rounding or interpolation.
+# Continuation-pad depths are cached alongside the axes.
 # ---------------------------------------------------------------------------
 _MAP_CACHE_MAX = 8
 
 
 class _ResampleMaps(NamedTuple):
-    """Cached cv2.remap index grids for one (source grid, region) pair.
+    """Cached cv2.remap coordinate axes for one (source grid, region) pair.
 
-    map_x/map_y are float32 (height, width) grids holding the target-pixel
+    map_x/map_y are 1D float32 X/Y axes holding the target-pixel
     coordinates in the *continuation-padded* source array (see
     ``_pad_continuation``); the pad depths are stored alongside so the
     per-frame padding is built identically every frame.
@@ -608,7 +605,7 @@ def _build_resample_maps(
     src_rows: int,
     src_cols: int,
 ) -> _ResampleMaps:
-    """Build cached cv2.remap index grids for one (source grid, region) pair.
+    """Build cached cv2.remap axes for one (source grid, region) pair.
 
     rows_f / cols_f are the float row/col indices of every target pixel in
     the cropped source grid (deterministic per pair — the source MRMS grid is
@@ -632,13 +629,8 @@ def _build_resample_maps(
     pad_left = max(0, -int(np.floor(np.min(cols_f))))
     pad_right = max(1, int(np.floor(np.max(cols_f))) - (src_cols - 1) + 1)
 
-    shape = (len(rows_f), len(cols_f))
-    map_x = np.broadcast_to(
-        (cols_f + pad_left).astype(np.float32)[None, :], shape
-    ).astype(np.float32)
-    map_y = np.broadcast_to(
-        (rows_f + pad_top).astype(np.float32)[:, None], shape
-    ).astype(np.float32)
+    map_x = (cols_f + pad_left).astype(np.float32)
+    map_y = (rows_f + pad_top).astype(np.float32)
 
     return _ResampleMaps(
         map_x, map_y, pad_top, pad_bottom, pad_left, pad_right
@@ -714,7 +706,7 @@ def _resample_mrms_to_region(
     4. Build target lat/lon axes from region bounds and pixel_size.
     5. Resample via cv2.remap bilinear interpolation (upscale for
        USCOMP/HICOMP, 1:1 for AKCOMP/PRCOMP, mild downsample for GUCOMP).
-       The map_x/map_y index grids are cached per (source grid, region), and
+       The map_x/map_y axes are cached per (source grid, region), and
        the source is continuation-padded so the legacy clipped-index corner
        behaviour (linear continuation north/west, constant edge south/east)
        is reproduced exactly.  The no-data mask is resampled the same way so
@@ -801,10 +793,26 @@ def _resample_mrms_to_region(
     # cv2.remap bilinear interpolation on the float32 source.  The maps
     # carry coordinates in the padded array, so every sample lands
     # in-bounds and the border mode is never involved.
-    resampled = cv2.remap(padded, maps.map_x, maps.map_y, cv2.INTER_LINEAR)
-    nodata_interp = cv2.remap(
-        padded_mask, maps.map_x, maps.map_y, cv2.INTER_LINEAR
-    )
+    resampled = _remap_striped(padded, maps)
+    nodata_interp = _remap_striped(padded_mask, maps)
     resampled = np.where(nodata_interp > 0.5, -33.0, resampled)
 
     return _dbz_float_to_uint8(resampled)
+
+
+def _remap_striped(data: np.ndarray, maps: _ResampleMaps) -> np.ndarray:
+    """Remap with bounded coordinate buffers and the original float precision.
+
+    Each strip uses the same coordinates as the former full-sized maps.
+    Only temporary maps are materialized; cached axes and source data stay
+    unchanged so other processing threads can reuse them.
+    """
+    height, width = len(maps.map_y), len(maps.map_x)
+    out = np.empty((height, width), dtype=data.dtype)
+    for start in range(0, height, 256):
+        end = min(start + 256, height)
+        shape = (end - start, width)
+        map_x = np.broadcast_to(maps.map_x[None, :], shape).copy()
+        map_y = np.broadcast_to(maps.map_y[start:end, None], shape).copy()
+        cv2.remap(data, map_x, map_y, cv2.INTER_LINEAR, dst=out[start:end])
+    return out

@@ -315,3 +315,43 @@ class TestMRMSDirCache:
         url = await src._find_nearest_url(datetime(2026, 4, 28, 6, 10, 0, tzinfo=timezone.utc))
         assert url is not None
         assert "060200" in url
+
+class TestStripedMRMSRemap:
+    @pytest.mark.parametrize("height", [255, 256, 257, 513])
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+    def test_matches_full_maps_across_strip_boundaries(self, height, dtype):
+        import cv2
+        from librewxr.sources.regional.north_america.usa.radar.mrms import source
+
+        rng = np.random.default_rng(42)
+        data = rng.uniform(-33, 65, (37, 53)).astype(dtype)
+        data[rng.random(data.shape) < 0.1] = 0
+        rows = np.linspace(-1.25, 38.75, height)
+        cols = np.linspace(-0.75, 54.25, 79)
+        maps = source._build_resample_maps(rows, cols, *data.shape)
+        padded = source._pad_continuation(
+            data, maps.pad_top, maps.pad_bottom, maps.pad_left, maps.pad_right,
+        )
+        padded.flags.writeable = False
+        maps.map_x.flags.writeable = False
+        maps.map_y.flags.writeable = False
+        # Independent reference: the original full-sized float32 maps.
+        shape = (height, len(cols))
+        map_x = np.broadcast_to((cols + maps.pad_left).astype(np.float32)[None, :], shape).copy()
+        map_y = np.broadcast_to((rows + maps.pad_top).astype(np.float32)[:, None], shape).copy()
+        expected = cv2.remap(padded, map_x, map_y, cv2.INTER_LINEAR)
+        result = source._remap_striped(padded, maps)
+        np.testing.assert_array_equal(result, expected)
+        assert result.dtype == dtype
+        assert not np.shares_memory(result, padded)
+
+    def test_cache_retains_axes_instead_of_destination_grids(self):
+        from librewxr.sources.regional.north_america.usa.radar.mrms import source
+
+        maps = source._build_resample_maps(
+            np.linspace(0, 3499, 5400), np.linspace(0, 6999, 12200), 3500, 7000,
+        )
+        assert maps.map_x.shape == (12200,)
+        assert maps.map_y.shape == (5400,)
+        assert maps.map_x.dtype == maps.map_y.dtype == np.float32
+        assert maps.map_x.nbytes + maps.map_y.nbytes == (12200 + 5400) * 4

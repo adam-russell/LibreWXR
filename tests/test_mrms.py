@@ -403,3 +403,51 @@ class TestStripedMRMSRemap:
         assert remap_shapes == [(256, 9)] * 4 + [(1, 9)] * 2
         assert encode_shapes == [(256, 9), (256, 9), (1, 9)]
         np.testing.assert_array_equal(result, np.full(data.shape, 124, dtype=np.uint8))
+
+
+class TestMRMSInputPreparation:
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+    @pytest.mark.parametrize("longitude_offset", [0., 360.])
+    @pytest.mark.parametrize("readonly", [False, True])
+    def test_private_crop_preserves_input_rounding_and_nodata(
+        self, monkeypatch, dtype, longitude_offset, readonly,
+    ):
+        from librewxr.data.regions import RegionDef
+        from librewxr.sources.regional.north_america.usa.radar.mrms import source
+
+        data = np.random.default_rng(42).uniform(-33, 65, (20, 30)).astype(dtype)
+        # The near-sentinel values round to -900 in float32, so the mask
+        # must be computed after conversion, just as in the original path.
+        data[7, 3:7] = [-999., -900.000001, -899.999999, np.nan]
+        original = data.copy()
+        data.flags.writeable = not readonly
+        ds = xr.Dataset(
+            {"r": (("latitude", "longitude"), data)},
+            coords={"latitude": np.arange(19., -1, -1),
+                    "longitude": np.arange(-140., -110.) + longitude_offset},
+        )
+        region = RegionDef(f"INPUT_{dtype}_{longitude_offset}_{readonly}", -137, -128, 5, 15, .5, "US")
+        # Existing crop rules retain rows 6:12 and columns 1:14 here.
+        crop = original.astype(np.float32)[6:12, 1:14]
+        mask = crop < -900
+        expected = np.where(mask, 0., crop).astype(np.float32)
+        prepared = []
+        pad = source._pad_continuation
+
+        def capture(array, *args):
+            assert array.dtype == np.float32
+            assert not np.shares_memory(array, data)
+            prepared.append(array.copy())
+            return pad(array, *args)
+
+        monkeypatch.setattr(source, "_pad_continuation", capture)
+        with np.errstate(invalid="ignore"):
+            result = source._resample_mrms_to_region(ds, region)
+        assert len(prepared) == 2
+        np.testing.assert_array_equal(prepared[0], expected)
+        np.testing.assert_array_equal(prepared[1], mask.astype(np.float32))
+        np.testing.assert_array_equal(data, original)
+        np.testing.assert_array_equal(ds.r.values, original)
+        assert data.flags.writeable == (not readonly)
+        assert result.dtype == np.uint8
+        assert result.shape == (region.height, region.width)

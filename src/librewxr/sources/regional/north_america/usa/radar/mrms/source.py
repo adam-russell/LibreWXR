@@ -716,7 +716,7 @@ def _resample_mrms_to_region(
        encoder.
     """
     var_name = list(ds.data_vars)[0]
-    data = ds[var_name].values.astype(np.float32)
+    data = ds[var_name].values
 
     lats = ds.latitude.values  # north-to-south (54.99 → 20.01)
     lons = ds.longitude.values  # west-to-east, may be 0-360 or -180-180
@@ -748,8 +748,13 @@ def _resample_mrms_to_region(
     # also gets bilinearly interpolated.  After interpolation, any
     # target pixel whose source neighbours were mostly no-data is
     # restored to the no-data sentinel (-33 → 0 in the encoder).
-    nodata_mask = (data < -900).astype(np.float32)
-    data = np.where(data < -900, 0.0, data).astype(np.float32)
+    # Copy only the crop, then replace no-data in this private float32 buffer.
+    # Cast before testing the sentinel to preserve the original rounding.
+    data = data.astype(np.float32)
+    missing = data < -900
+    nodata_mask = missing.astype(np.float32)
+    data[missing] = 0.0
+    del missing
 
     # Build target grid axes.
     # Target lats go north-to-south (descending) so that row 0 of the

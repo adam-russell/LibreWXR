@@ -1154,6 +1154,18 @@ def _blend_cacomp_arrays(
 
 
 def _despeckle(data: np.ndarray, min_neighbors: int) -> np.ndarray:
+    """Bound cleanup workspaces to a strip, including one neighbor row each side."""
+    result = np.empty_like(data)
+    height = data.shape[0]
+    for start in range(0, height, 256):
+        end = min(start + 256, height)
+        top, bottom = max(0, start - 1), min(height, end + 1)
+        block = _despeckle_block(data[top:bottom], min_neighbors)
+        result[start:end] = block[start - top:end - top]
+    return result
+
+
+def _despeckle_block(data: np.ndarray, min_neighbors: int) -> np.ndarray:
     """Remove isolated pixels (ground clutter / AP artifacts).
 
     Builds the 8-neighbor count with strided view additions into a single

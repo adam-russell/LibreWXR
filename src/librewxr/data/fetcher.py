@@ -43,6 +43,11 @@ class RadarFetcher:
         "USCOMP", "CACOMP", "AKCOMP", "HICOMP", "PRCOMP", "GUCOMP"
     }
 
+    # Full-region fallback, blending and despeckling can allocate large
+    # buffers. Share two slots across this fetcher's batches, independently
+    # of the primary radar fetch-concurrency setting.
+    _POST_PROCESS_CONCURRENCY = 2
+
     # When a region's fetch returns no data, fill the new frame from the
     # most recent prior frame in the store rather than leaving the region
     # absent (which causes the renderer to fall through to NWP fill, a
@@ -86,6 +91,7 @@ class RadarFetcher:
     ):
         self._store = store
         self._cache = cache
+        self._postprocess_sem = asyncio.Semaphore(self._POST_PROCESS_CONCURRENCY)
         # Every enabled NWP source flows through ``nwp_contributions``;
         # the dispatch loop in ``_fetch_auxiliary_grids`` and the
         # shutdown loop in ``close()`` iterate this list, so adding a
@@ -781,8 +787,8 @@ class RadarFetcher:
 
         # Per-result post-processing (fallback, CACOMP blend, despeckle)
         # touches only its own result, so all finalization coroutines fan
-        # out under one gather instead of serialising each result's
-        # awaits.  Exception results keep their inline warning + skip;
+        # out under one gather, with two shared slots bounding their
+        # full-region work. Exception results keep their inline warning + skip;
         # gather preserves the order of the coroutines passed, so the
         # merge pass below zips back 1:1 in the original result order.
         post_start = time.monotonic()
@@ -938,11 +944,25 @@ class RadarFetcher:
         source_arg: int | datetime,
         result: np.ndarray | None,
     ) -> np.ndarray | None:
+        """Finalize one result while holding a shared post-processing slot."""
+        async with self._postprocess_sem:
+            return await self._process_result(
+                region, ts, source_type, source_arg, result,
+            )
+
+    async def _process_result(
+        self,
+        region: RegionDef,
+        ts: int,
+        source_type: str,
+        source_arg: int | datetime,
+        result: np.ndarray | None,
+    ) -> np.ndarray | None:
         """Run one fetch result's post-processing: fallback, blend, despeckle.
 
         Extracted from the result loop in ``_fetch_timestamps`` so every
         result's per-result awaits (cross-source fallback, CACOMP blend,
-        worker-thread despeckle) overlap under a single gather instead of
+        worker-thread despeckle) overlap under a bounded gather instead of
         serialising result after result.  The logic is byte-identical to
         the old inline pass: returns the final array, or ``None`` when the
         result was a silent drop (the caller then skips the slot).

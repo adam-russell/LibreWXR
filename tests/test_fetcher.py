@@ -191,6 +191,7 @@ def _build_fetcher(store, tile_cache, radar_cache, region):
     fetcher = RadarFetcher.__new__(RadarFetcher)
     fetcher._store = store
     fetcher._cache = tile_cache
+    fetcher._postprocess_sem = asyncio.Semaphore(fetcher._POST_PROCESS_CONCURRENCY)
     fetcher._nwp_contributions = []
     fetcher._satellite_contributions = []
     fetcher._satellite_tasks = {}

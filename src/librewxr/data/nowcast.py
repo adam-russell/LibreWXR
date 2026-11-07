@@ -202,17 +202,22 @@ def _coarsen_frame(frame: np.ndarray, sigma_px: float, wrap: bool) -> np.ndarray
         # No visible effect at this sigma — skip the work entirely and
         # return the caller's array untouched (it may alias stored data).
         return frame
-    f = frame.astype(np.float32)
+    # OpenCV needs a contiguous destination even for transposed input. This
+    # float32 buffer is private, so filtering, rounding and clipping can reuse
+    # its storage without touching the caller's frame or memmap.
+    f = frame.astype(np.float32, order="C")
     if wrap:
         pad = min(int(np.ceil(sigma_px * 3)), max(1, frame.shape[1] // 8))
         f = np.pad(f, ((0, 0), (pad, pad)), mode="wrap")
-        f = cv2.GaussianBlur(f, (0, 0), sigma_px)
+        cv2.GaussianBlur(f, (0, 0), sigma_px, dst=f)
         f = f[:, pad : pad + frame.shape[1]]
     else:
         # Default border (replicate) — zero-constant edges would erode
         # echoes sitting on the coverage boundary.
-        f = cv2.GaussianBlur(f, (0, 0), sigma_px)
-    return np.rint(f).clip(0, 255).astype(np.uint8)
+        cv2.GaussianBlur(f, (0, 0), sigma_px, dst=f)
+    np.rint(f, out=f)
+    np.clip(f, 0, 255, out=f)
+    return f.astype(np.uint8)
 
 
 def _clamp_flow(flow: np.ndarray, max_magnitude_px: float) -> np.ndarray:

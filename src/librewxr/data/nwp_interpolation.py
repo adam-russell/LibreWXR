@@ -50,21 +50,23 @@ _FARNEBACK = dict(
 )
 
 
-# Coordinate grids are pure functions of their shape, yet the pair/forward
-# helpers rebuild them via np.mgrid on every call.  Cache the built grids
-# keyed by shape — at most a handful of distinct grid shapes exist per
-# process.  Thread-safety: the dict is read-mostly and mutation only adds
+# Cache compact coordinate axes by shape for run, pair and forward warps.
+# Broadcasting constructs the full remap maps only when needed; the cached
+# row/column indices use O(h + w) storage instead of O(h * w).
+# Thread-safety: the dict is read-mostly and mutation only adds
 # whole entries (GIL-atomic); the worst-case race is two threads building
 # the same constant twice — harmless, so no lock.
 _GRID_CACHE: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
 
 
 def _coordinate_grid(h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
-    """Return cached float32 (ys, xs) coordinate grids for shape (h, w)."""
+    """Return cached float32 (h, 1) row and (1, w) column indices."""
     grids = _GRID_CACHE.get((h, w))
     if grids is None:
-        mgrid = np.mgrid[0:h, 0:w].astype(np.float32)
-        grids = (mgrid[0], mgrid[1])
+        grids = (
+            np.arange(h, dtype=np.float32)[:, None],
+            np.arange(w, dtype=np.float32)[None, :],
+        )
         _GRID_CACHE[(h, w)] = grids
     return grids
 
@@ -123,9 +125,9 @@ def interpolate_run(
         dict(snow_masks_by_ts) if snow_masks_by_ts is not None else None
     )
 
-    # Pre-compute coordinate grids (shared across all warp ops in this run)
+    # Reuse compact coordinate axes across all warp operations in this run
     h, w = next(iter(frames_by_ts.values())).shape
-    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    ys, xs = _coordinate_grid(h, w)
 
     t0_wall = time.monotonic()
     total_interpolated = 0

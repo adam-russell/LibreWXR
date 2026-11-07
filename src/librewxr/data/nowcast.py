@@ -884,8 +884,8 @@ class NowcastGenerator:
         if not forecast_regions:
             return [], {}
 
-        # Precompute the float32 mgrid coordinate grids ONCE per region
-        # instead of rebuilding them for every forecast step — xs/ys are
+        # Precompute compact float32 coordinate axes once per region.
+        # Broadcast them when building each step's remap maps; xs/ys are
         # identical across all steps (only map_x/map_y, which are
         # steps·flow away from them, vary per step).  Built up-front for
         # every region that has both a warp flow and data so the
@@ -897,7 +897,7 @@ class NowcastGenerator:
             data = latest_regions.get(region_name)
             if flow is not None and data is not None:
                 h, w = data.shape
-                ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+                ys, xs = _coordinate_axes(h, w)
                 coord_grids[region_name] = (ys, xs)
 
         # Generate extrapolated frames for each step.  Phase B submits
@@ -1244,6 +1244,11 @@ def _compute_region_flow(
     return region_name, clamped, flow_unclamped, clamp_bound
 
 
+def _coordinate_axes(h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return float32 row/column indices using O(h + w) storage."""
+    return np.arange(h, dtype=np.float32)[:, None], np.arange(w, dtype=np.float32)[None, :]
+
+
 def _extrapolate_forward(
     frame: np.ndarray, flow: np.ndarray, steps: int,
     xs: np.ndarray | None = None,
@@ -1263,10 +1268,10 @@ def _extrapolate_forward(
     warp time (``_upscale_flow`` — the same resize math the old code
     applied at storage time, so results are numerically identical).
     Full-resolution flows (small regions, tests) pass through
-    untouched.  ``xs``/``ys`` are optional precomputed float32
-    coordinate grids — ``_generate_sync`` builds them once per region
-    and reuses them across forecast steps (they are identical for every
-    step); when omitted they are built here (direct-call / test path).
+    untouched.  ``xs``/``ys`` are optional broadcastable float32
+    coordinates. ``_generate_sync`` keeps them as compact row/column axes
+    and reuses them across forecast steps; existing callers can also pass
+    full grids. When omitted they are built here (direct-call / test path).
 
     ``max_px`` optionally applies ``_clamp_flow`` to the upscaled field
     right here — the old pipeline clamped the full-res field once after
@@ -1301,9 +1306,9 @@ def _extrapolate_forward(
         # Coordinate grid over the PADDED frame (column indices are P-space
         # already — the crop back below restores the unwrapped view).  The
         # row axis never wraps.
-        ys, xs = np.mgrid[0:h, 0 : w + 2 * pad].astype(np.float32)
+        ys, xs = _coordinate_axes(h, w + 2 * pad)
     elif xs is None or ys is None:
-        ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+        ys, xs = _coordinate_axes(h, w)
 
     map_x = xs - steps * flow[..., 0]
     map_y = ys - steps * flow[..., 1]

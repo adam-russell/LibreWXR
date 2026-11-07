@@ -675,21 +675,27 @@ def _pad_continuation(
     Rows are padded first so corner cells (overshoot in both axes)
     interpolate the same four real corner cells the legacy code gathered.
     """
+    if not (pad_top or pad_bottom or pad_left or pad_right):
+        return arr
+    h, w = arr.shape
+    # Match the original dtype promotion for extrapolated borders. Fill the
+    # final allocation directly instead of copying each intermediate grid.
+    dtype = np.result_type(arr.dtype, np.float32) if pad_top or pad_left else arr.dtype
+    result = np.empty((h + pad_top + pad_bottom, w + pad_left + pad_right), dtype=dtype)
+    middle = result[:, pad_left:pad_left + w]
+    middle[pad_top:pad_top + h] = arr
     if pad_top > 0:
-        # k runs pad_top..1 (topmost row is the deepest continuation).  With
-        # map_y = rows_f + pad_top in (0, 1] the remap then samples the
-        # k=pad_top..pad_top-1 rows — exactly the unclamped weight pair the
-        # legacy (1 - dr) * edge0 + dr * edge1 produces for dr = -rows_f.
         k = (pad_top - np.arange(pad_top, dtype=np.float32))[:, None]
-        arr = np.concatenate([(1 + k) * arr[0:1, :] - k * arr[1:2, :], arr], axis=0)
+        middle[:pad_top] = (1 + k) * arr[0:1, :] - k * arr[1:2, :]
     if pad_bottom > 0:
-        arr = np.concatenate([arr, np.repeat(arr[-1:, :], pad_bottom, axis=0)], axis=0)
+        middle[pad_top + h:] = arr[-1:, :]
     if pad_left > 0:
+        # Row padding is complete, preserving the original corner arithmetic.
         k = (pad_left - np.arange(pad_left, dtype=np.float32))[None, :]
-        arr = np.concatenate([(1 + k) * arr[:, 0:1] - k * arr[:, 1:2], arr], axis=1)
+        result[:, :pad_left] = (1 + k) * middle[:, 0:1] - k * middle[:, 1:2]
     if pad_right > 0:
-        arr = np.concatenate([arr, np.repeat(arr[:, -1:], pad_right, axis=1)], axis=1)
-    return arr
+        result[:, pad_left + w:] = middle[:, -1:]
+    return result
 
 
 def _resample_mrms_to_region(

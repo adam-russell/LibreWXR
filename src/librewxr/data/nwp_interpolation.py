@@ -338,6 +338,9 @@ def _interpolate_precip(
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
 
+    # Remap is complete; release the full-grid maps before the next warp.
+    del map0_x, map0_y
+
     map1_x = xs + (1 - t) * flow[..., 0]
     map1_y = ys + (1 - t) * flow[..., 1]
     warped1 = cv2.remap(
@@ -345,6 +348,8 @@ def _interpolate_precip(
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
+
+    del map1_x, map1_y
 
     blended = (1 - t) * warped0.astype(np.float32) + t * warped1.astype(np.float32)
 
@@ -370,7 +375,6 @@ def _interpolate_snow(
     the regional sources' on-disk storage convention.
     """
     s0_f = snow0.astype(np.float32)
-    s1_f = snow1.astype(np.float32)
 
     map0_x = xs - t * flow[..., 0]
     map0_y = ys - t * flow[..., 1]
@@ -380,6 +384,10 @@ def _interpolate_snow(
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
 
+    # Drop the first conversion and maps before preparing the second warp.
+    del s0_f, map0_x, map0_y
+
+    s1_f = snow1.astype(np.float32)
     map1_x = xs + (1 - t) * flow[..., 0]
     map1_y = ys + (1 - t) * flow[..., 1]
     warped1 = cv2.remap(
@@ -387,6 +395,8 @@ def _interpolate_snow(
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
+
+    del s1_f, map1_x, map1_y
 
     blended = (1 - t) * warped0 + t * warped1
     # Preserve bool dtype if both inputs were bool, otherwise uint8.

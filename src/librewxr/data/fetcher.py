@@ -8,6 +8,7 @@ import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 
+import cv2
 import numpy as np
 
 from librewxr.config import settings
@@ -1118,7 +1119,7 @@ def _blend_cacomp_arrays(
     """Blend MRMS and MSC Canada arrays for CACOMP (pure numpy).
 
     Runs in a worker thread from ``RadarFetcher._blend_cacomp`` so the
-    full-region mask build and boolean-indexed assignment never block
+    full-region mask build and masked copy never block
     the event loop.
     """
     # Build the MRMS extent mask at the region's pixel resolution.
@@ -1142,13 +1143,8 @@ def _blend_cacomp_arrays(
     result = msc_data.copy()
     # Only overlay MRMS where it has actual data (non-zero) within its extent
     mrms_has_data = (mrms_data > 0) & mrms_extent_mask
-    result[mrms_has_data] = mrms_data[mrms_has_data]
-
-    # Outside MRMS extent, keep MSC as-is (including zeros for no data)
-    # Inside MRMS extent but where MRMS has no data (value=0), also keep
-    # MSC if it has data — but only if MSC data exists.
-    mrms_extent_nodata = mrms_extent_mask & (mrms_data == 0) & (msc_data > 0)
-    result[mrms_extent_nodata] = msc_data[mrms_extent_nodata]
+    np.copyto(result, mrms_data, where=mrms_has_data)
+    # Every other pixel already contains its original MSC value.
 
     return result
 
@@ -1166,26 +1162,22 @@ def _despeckle(data: np.ndarray, min_neighbors: int) -> np.ndarray:
 
 
 def _despeckle_block(data: np.ndarray, min_neighbors: int) -> np.ndarray:
-    """Remove isolated pixels (ground clutter / AP artifacts).
+    """Remove isolated pixels with strip-sized native neighbor counting.
 
-    Builds the 8-neighbor count with strided view additions into a single
-    pre-sized buffer — no (h+2) x (w+2) padded copy, so each call
-    allocates just the boolean mask, the count buffer, and the result
-    copy.  Slicing also avoids the wrap-around artifact that np.roll
-    produces at array edges.
+    The 3x3 sum includes the center pixel. For nonzero pixels, comparing
+    against min_neighbors + 1 gives the original eight-neighbor rule.
+    Constant-zero borders preserve edge behavior without wrapping. Reuse
+    the byte-sized count buffer as removal flags to bound temporary memory.
     """
     mask = data > 0
-    h, w = mask.shape
-    count = np.zeros((h, w), dtype=np.int8)
-    count[1:, :] += mask[:-1, :]
-    count[:-1, :] += mask[1:, :]
-    count[:, 1:] += mask[:, :-1]
-    count[:, :-1] += mask[:, 1:]
-    count[1:, 1:] += mask[:-1, :-1]
-    count[1:, :-1] += mask[:-1, 1:]
-    count[:-1, 1:] += mask[1:, :-1]
-    count[:-1, :-1] += mask[1:, 1:]
-
+    if mask.size == 0:
+        return data.copy()
+    count = cv2.boxFilter(
+        mask.view(np.uint8), cv2.CV_8U, (3, 3),
+        normalize=False, borderType=cv2.BORDER_CONSTANT,
+    )
+    np.less(count, min_neighbors + 1, out=count)
+    np.bitwise_and(count, mask, out=count)
     result = data.copy()
-    result[mask & (count < min_neighbors)] = 0
+    result[count.view(np.bool_)] = 0
     return result

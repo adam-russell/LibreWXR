@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 Joshua Kimsey
 """Compare local rendering against a Git revision, without fetching live data.
 
 Run with the project's Python environment and --baseline-ref <commit>, or

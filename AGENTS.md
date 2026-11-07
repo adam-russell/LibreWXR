@@ -267,7 +267,7 @@ The discovery walker picks up the new package automatically — no per-source pl
 
 ## Conventions
 
-- **File headers:** `# SPDX-License-Identifier: AGPL-3.0-or-later` + `# Copyright (C) 2026 Joshua Kimsey` on every source file
+- **File headers:** `# SPDX-License-Identifier: AGPL-3.0-or-later` on every source file. Preserve existing copyright notices.
 - **Commit style:** imperative mood, concise (e.g., "Add precipitation motion arrows")
 - **Commit sign-off:** every commit must carry a `Signed-off-by:` trailer (`git commit -s`) whose name and email match the commit author identity; enforced on pull requests by `.github/workflows/dco.yml`.
 - **Contribution licensing:** LibreWXR is dual-licensed (AGPL-3.0-or-later plus a separate commercial license offered by the maintainer). Contributions are governed by the license grant in CONTRIBUTING.md, restated as required checkboxes in `.github/PULL_REQUEST_TEMPLATE.md`; do not weaken or bypass those terms.

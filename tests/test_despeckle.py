@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 Joshua Kimsey
 """Cleanup output, strip-edge neighborhoods, input ownership and memory bounds."""
 import numpy as np
 import pytest
@@ -92,3 +91,27 @@ def test_neighbor_workspaces_are_strip_sized(monkeypatch):
     result = source._despeckle(data, 3)
     assert block_shapes == [(257, 9), (258, 9), (2, 9)]
     np.testing.assert_array_equal(result, data)
+
+
+@pytest.mark.parametrize("layout", ["fortran", "memmap"])
+@pytest.mark.parametrize("min_neighbors", [0, 1, 3, 8, 9, 255])
+def test_native_counting_preserves_read_only_inputs_and_strip_halos(tmp_path, layout, min_neighbors):
+    rng = np.random.default_rng(1772)
+    data = rng.integers(1, 256, (520, 19), dtype=np.uint8)
+    data[rng.random(data.shape) < 0.8] = 0
+    data[254:258, 3:7] = 134
+    data[510:514, 12:16] = 114
+    data[0, 0] = data[-1, -1] = 211
+    if layout == "fortran":
+        array = np.asfortranarray(data)
+    else:
+        path = tmp_path / "radar.npy"
+        np.save(path, data)
+        array = np.load(path, mmap_mode="r")
+    array.flags.writeable = False
+    actual = source._despeckle(array, min_neighbors)
+    np.testing.assert_array_equal(actual, _reference_despeckle(data, min_neighbors))
+    np.testing.assert_array_equal(array, data)
+    assert actual.dtype == np.uint8 and actual.shape == data.shape
+    assert actual.flags.writeable
+    assert not np.shares_memory(actual, array)

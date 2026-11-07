@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 Joshua Kimsey
 """Interpolation workspaces are released after use without changing output."""
 import weakref
 

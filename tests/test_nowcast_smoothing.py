@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 Joshua Kimsey
 """Exact smoothing output and private float-buffer reuse."""
 import cv2
 import numpy as np

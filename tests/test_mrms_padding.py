@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 Joshua Kimsey
 """Preserve continuation padding, corner arithmetic and MRMS output bytes."""
 import numpy as np
 import pytest

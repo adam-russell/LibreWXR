@@ -1116,3 +1116,112 @@ class TestIFSInterpolationMemoHelpers:
             )
             is None
         )
+
+
+class TestNativeTimestepBuffers:
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["float32", "float64"])
+    @pytest.mark.parametrize("layout", ["contiguous", "fortran", "strided", "memmap"])
+    @pytest.mark.parametrize("has_snow", [False, True], ids=["rain_only", "with_snow"])
+    def test_private_inputs_released_after_regridding(
+        self, monkeypatch, tmp_path, dtype, layout, has_snow,
+    ):
+        """Reader closure, array layout and early release preserve encoded output."""
+        import weakref
+        from librewxr.sources.world.ifs import grid as module
+
+        precip = np.array([
+            [0, 0.005, 0.01, 0.0101, 1, 10],
+            [-1, 1e-7, 1e-6, 0.5, 2, 20],
+        ], dtype=dtype)
+        snow = precip * np.array([
+            [0, 0, 0, 0, 0, 0], [0, 0, 0, 1, 0.5, 1],
+        ], dtype=dtype)
+        fields = {"precipitation": precip, "snowfall_water_equivalent": snow}
+        expected_inputs = {name: value.flatten().astype(np.float32) for name, value in fields.items()}
+        references = []
+        accessed = []
+
+        class Variable:
+            def __init__(self, name):
+                source = fields[name]
+                if layout == "fortran":
+                    self.value = np.asfortranarray(source)
+                elif layout == "strided":
+                    storage = np.zeros((2, 12), dtype=dtype)
+                    self.value = storage[:, ::2]
+                    self.value[:] = source
+                elif layout == "memmap":
+                    path = tmp_path / (name + ".npy")
+                    np.save(path, source)
+                    self.value = np.load(path, mmap_mode="r")
+                else:
+                    self.value = source.copy()
+                self.closed = False
+
+            def __getitem__(self, key):
+                return self.value[key]
+
+            def close(self):
+                self.closed = True
+                if self.value.flags.writeable:
+                    # Simulate a reader invalidating its borrowed buffers.
+                    self.value[:] = -999
+
+        class Reader:
+            def __init__(self):
+                self.variables = {}
+                self.closed = False
+
+            def get_child_by_name(self, name):
+                accessed.append(name)
+                self.variables[name] = Variable(name)
+                return self.variables[name]
+
+            def close(self):
+                self.closed = True
+
+        reader = Reader()
+
+        def regrid(raw, in_grid, out_grid, method):
+            assert reader.closed and all(v.closed for v in reader.variables.values())
+            assert in_grid == {"grid": "O1280"}
+            assert out_grid == {"grid": [0.1, 0.1]} and method == "linear"
+            name = "precipitation" if not references else "snowfall_water_equivalent"
+            np.testing.assert_array_equal(raw, expected_inputs[name])
+            assert raw.dtype == np.float32 and raw.flags.c_contiguous
+            assert not np.shares_memory(raw, reader.variables[name].value)
+            if references:
+                assert references[0]() is None, "Precip input retained during snow regridding"
+            references.append(weakref.ref(raw))
+            return raw.astype(np.float64).reshape(2, 6)
+
+        original_roll = np.roll
+
+        def roll_after_regridding(*args, **kwargs):
+            assert references and all(ref() is None for ref in references), "Native inputs retained during output conversion"
+            return original_roll(*args, **kwargs)
+
+        monkeypatch.setattr("librewxr.data.retry.retry_sync", lambda *args, **kwargs: reader)
+        monkeypatch.setattr(module, "interpolate", regrid)
+        monkeypatch.setattr(module, "GRID_WIDTH", 6)
+        monkeypatch.setattr(settings, "ecmwf_snow_ratio_threshold", 0.5)
+        monkeypatch.setattr(np, "roll", roll_after_regridding)
+        grid = ECMWFGrid(cache_dir=tmp_path / "cache")
+        actual, is_snow = grid._fetch_one_timestep(
+            None, "frozen", "2026-11-07T12:00:00Z", has_snow, [],
+        )
+
+        # Golden encodings include dry/negative/threshold-boundary rain,
+        # rain versus snow Z-R curves, strict snow ratio > 0.5, and the roll.
+        expected = np.array([
+            [46, 110, 142, 0, 0, 0],
+            [117, 119, 182, 0, 0, 0] if has_snow else [100, 119, 151, 0, 0, 0],
+        ], dtype=np.uint8)
+        expected_snow = np.zeros((2, 6), dtype=bool)
+        if has_snow:
+            expected_snow[1, [0, 2]] = True
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(is_snow, expected_snow)
+        assert actual.dtype == np.uint8 and is_snow.dtype == bool
+        assert accessed == (["precipitation", "snowfall_water_equivalent"] if has_snow else ["precipitation"])
+        assert len(references) == (2 if has_snow else 1)

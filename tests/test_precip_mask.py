@@ -726,3 +726,45 @@ class TestSyncHelper:
         assert mask[300, 100]
         assert mask[300, 101]  # dilated east
         assert not mask[300, 102]
+
+
+class TestProjectionInputLayouts:
+    @pytest.mark.parametrize("layout", ["contiguous", "fortran", "transposed", "strided", "memmap"])
+    @pytest.mark.parametrize("threshold", [0, 84, 255, 256])
+    def test_read_only_inputs_preserve_conservative_mask(self, tmp_path, layout, threshold):
+        """Workspace reuse must preserve hits and never overwrite source frames."""
+        region = RegionDef(
+            name="LAYOUT", west=0, east=4, south=0, north=4,
+            pixel_size=0.1, group="TEST",
+        )
+        source = np.zeros((region.height, region.width), dtype=np.uint8)
+        # Lat 3, lon 1 is a corner shared by four coarse cells.
+        source[10, 10] = 255
+        if layout == "fortran":
+            array = np.asfortranarray(source)
+        elif layout == "transposed":
+            array = np.ascontiguousarray(source.T).T
+        elif layout == "strided":
+            storage = np.zeros((region.height, region.width * 2), dtype=np.uint8)
+            array = storage[:, ::2]
+            array[:] = source
+        elif layout == "memmap":
+            path = tmp_path / "radar.npy"
+            np.save(path, source)
+            array = np.load(path, mmap_mode="r")
+        else:
+            array = source.copy()
+        array.flags.writeable = False
+        before = array.copy()
+        store = PrecipMaskStore()
+        store._ensure_meshgrid()
+        actual = np.zeros((GH, GW), dtype=bool)
+        store._project_region(actual, region, array, threshold)
+
+        expected = np.zeros((GH, GW), dtype=bool)
+        if threshold == 0:
+            expected[172:180, 360:368] = True  # Every in-bounds cell.
+        elif threshold <= 255:
+            expected[173:175, 361:363] = True  # Four cells touching the blob.
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(array, before)

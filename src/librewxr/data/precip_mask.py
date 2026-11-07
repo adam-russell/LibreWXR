@@ -393,7 +393,10 @@ class PrecipMaskStore:
         span_cols = float(col_diff[col_pair_ok].max()) if col_pair_ok.any() else None
         span_rows = float(row_diff[row_pair_ok].max()) if row_pair_ok.any() else None
 
-        hits = (np.asanyarray(region_array) >= pixel_threshold).astype(np.uint8)
+        # Keep the source read-only and reuse one C-contiguous workspace
+        # for thresholding and dilation, including non-contiguous inputs.
+        hits = np.empty(region_array.shape, dtype=np.uint8)
+        np.greater_equal(np.asanyarray(region_array), pixel_threshold, out=hits)
 
         if span_cols is None or span_rows is None:
             # Fewer than 2 in-bounds cells along an axis — the region is
@@ -411,7 +414,7 @@ class PrecipMaskStore:
         hc = int(np.ceil(span_cols / 2)) + 1
         kh = max(3, 2 * hr + 1)
         kw = max(3, 2 * hc + 1)
-        dilated = cv2.dilate(hits, np.ones((kh, kw), dtype=np.uint8))
+        dilated = cv2.dilate(hits, np.ones((kh, kw), dtype=np.uint8), dst=hits)
 
         row_i = np.clip(np.rint(row_grid).astype(np.int32), 0, region.height - 1)
         col_i = np.clip(np.rint(col_grid).astype(np.int32), 0, region.width - 1)

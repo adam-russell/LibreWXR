@@ -568,15 +568,15 @@ class ECMWFGrid:
             raise RuntimeError(f"Failed to read ECMWF timestep {vt} after retries")
         try:
             precip_var = reader.get_child_by_name("precipitation")
-            precip_raw = precip_var[:].flatten().astype(np.float32)
+            # One owned C-order float32 copy survives closing the reader;
+            # flatten().astype() would make two copies.
+            precip_raw = precip_var[:].astype(np.float32, order="C").reshape(-1)
             precip_var.close()
 
             if has_snow:
                 snow_var = reader.get_child_by_name("snowfall_water_equivalent")
-                snow_raw = snow_var[:].flatten().astype(np.float32)
+                snow_raw = snow_var[:].astype(np.float32, order="C").reshape(-1)
                 snow_var.close()
-            else:
-                snow_raw = np.zeros_like(precip_raw)
         finally:
             reader.close()
 
@@ -587,6 +587,8 @@ class ECMWFGrid:
             out_grid={"grid": [PIXEL_SIZE, PIXEL_SIZE]},
             method="linear",
         )
+        # Native fields are no longer needed after their own regridding.
+        del precip_raw
         if has_snow:
             snow_grid = interpolate(
                 snow_raw,
@@ -594,6 +596,7 @@ class ECMWFGrid:
                 out_grid={"grid": [PIXEL_SIZE, PIXEL_SIZE]},
                 method="linear",
             )
+            del snow_raw
         else:
             snow_grid = np.zeros_like(precip_grid)
 

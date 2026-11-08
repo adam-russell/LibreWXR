@@ -310,3 +310,59 @@ class TestBoundedPaletteDecoder:
         result = _decode_msc_canada_png(_save_test_png(Image.fromarray(rgba)))
         assert sizes == [3, 7]
         np.testing.assert_array_equal(result, expected)
+
+
+class TestChannelDistanceAccumulation:
+    @pytest.mark.parametrize("alpha", ["opaque", "mixed"])
+    def test_exact_int32_distances_match_int64_oracle_across_blocks(self, monkeypatch, alpha):
+        from librewxr.sources.regional.north_america.canada.radar.msc_canada import source
+
+        monkeypatch.setattr(source, "_MSC_CANADA_DECODE_CHUNK_PIXELS", 7)
+        rng = np.random.default_rng(1772)
+        rgba = rng.integers(0, 256, (17, 19, 4), dtype=np.uint8)
+        pixels = rgba.reshape(-1, 4)
+        pixels[:, 3] = 255 if alpha == "opaque" else np.resize([0, 1, 127, 255], len(pixels))
+        visible = pixels[pixels[:, 3] > 0, :3].astype(np.int64)
+        anchors = np.array([row[:3] for row in source._MSC_CANADA_PALETTE], dtype=np.int64)
+        expected_output = _scalar_palette_reference(rgba)
+        original_argmin = np.argmin
+        offset = 0
+
+        def checked_argmin(distances, *args, **kwargs):
+            nonlocal offset
+            count = len(distances)
+            assert count <= 7 and distances.dtype == np.int32
+            rgb = visible[offset:offset + count]
+            expected = np.sum((rgb[:, None, :] - anchors[None, :, :]) ** 2, axis=2)
+            np.testing.assert_array_equal(distances, expected)
+            assert np.all((distances >= 0) & (distances <= 195075))
+            offset += count
+            return original_argmin(distances, *args, **kwargs)
+
+        monkeypatch.setattr(source.np, "argmin", checked_argmin)
+        actual = _decode_msc_canada_png(_save_test_png(Image.fromarray(rgba)))
+        assert offset == len(visible)
+        np.testing.assert_array_equal(actual, expected_output)
+
+    def test_rgb_extremes_do_not_overflow_distance_accumulator(self, monkeypatch):
+        from librewxr.sources.regional.north_america.canada.radar.msc_canada import source
+
+        monkeypatch.setattr(source, "_MSC_CANADA_PALETTE", ((0, 0, 0, 1.4142), (255, 255, 255, 2.8284)))
+        rgba = np.array([[(0, 0, 0, 255), (255, 255, 255, 255),
+                          (128, 128, 128, 255), (255, 0, 255, 255), (0, 255, 0, 255)]], dtype=np.uint8)
+        expected_distances = np.array([[0, 195075], [195075, 0], [49152, 48387],
+                                       [130050, 65025], [65025, 130050]], dtype=np.int64)
+        expected_output = _scalar_palette_reference(rgba)
+        original_argmin = np.argmin
+        observed = []
+
+        def checked_argmin(distances, *args, **kwargs):
+            assert distances.dtype == np.int32
+            np.testing.assert_array_equal(distances, expected_distances)
+            observed.append(True)
+            return original_argmin(distances, *args, **kwargs)
+
+        monkeypatch.setattr(source.np, "argmin", checked_argmin)
+        actual = _decode_msc_canada_png(_save_test_png(Image.fromarray(rgba)))
+        assert observed == [True]
+        np.testing.assert_array_equal(actual, expected_output)

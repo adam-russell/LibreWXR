@@ -14,6 +14,7 @@ from pathlib import Path
 import fsspec
 import numpy as np
 from earthkit.regrid import interpolate
+from earthkit.regrid.db import find as find_regrid_matrix
 from omfiles import OmFileReader
 
 from librewxr.config import settings
@@ -580,24 +581,27 @@ class ECMWFGrid:
         finally:
             reader.close()
 
-        # Regrid from O1280 reduced Gaussian to regular 0.1° lat/lon
-        precip_grid = interpolate(
-            precip_raw,
-            in_grid={"grid": "O1280"},
-            out_grid={"grid": [PIXEL_SIZE, PIXEL_SIZE]},
-            method="linear",
-        )
-        # Native fields are no longer needed after their own regridding.
-        del precip_raw
+        # Reuse one set of weights for both fields with the same sparse
+        # multiplication/reshape used by earthkit's NumPy interpolator.
         if has_snow:
-            snow_grid = interpolate(
-                snow_raw,
+            matrix, output_shape = find_regrid_matrix(
+                {"grid": "O1280"}, {"grid": [PIXEL_SIZE, PIXEL_SIZE]}, "linear",
+            )
+            if matrix is None:
+                raise ValueError("No O1280 to 0.1-degree linear matrix found")
+            precip_grid = (matrix @ precip_raw.reshape(-1, 1)).reshape(output_shape)
+            del precip_raw
+            snow_grid = (matrix @ snow_raw.reshape(-1, 1)).reshape(output_shape)
+            # Release weights before shifts and output conversion; do not cache them.
+            del snow_raw, matrix
+        else:
+            precip_grid = interpolate(
+                precip_raw,
                 in_grid={"grid": "O1280"},
                 out_grid={"grid": [PIXEL_SIZE, PIXEL_SIZE]},
                 method="linear",
             )
-            del snow_raw
-        else:
+            del precip_raw
             snow_grid = np.zeros_like(precip_grid)
 
         # Shift from 0-360 to -180..180

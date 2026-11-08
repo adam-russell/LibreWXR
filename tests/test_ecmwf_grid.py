@@ -1140,6 +1140,7 @@ class TestNativeTimestepBuffers:
         expected_inputs = {name: value.flatten().astype(np.float32) for name, value in fields.items()}
         references = []
         accessed = []
+        matrix_lookups, matrix_references = [], []
 
         class Variable:
             def __init__(self, name):
@@ -1192,17 +1193,35 @@ class TestNativeTimestepBuffers:
             assert not np.shares_memory(raw, reader.variables[name].value)
             if references:
                 assert references[0]() is None, "Precip input retained during snow regridding"
-            references.append(weakref.ref(raw))
+            owner = raw
+            while isinstance(owner.base, np.ndarray):
+                owner = owner.base
+            references.append(weakref.ref(owner))
             return raw.astype(np.float64).reshape(2, 6)
+
+        class Matrix:
+            def __matmul__(self, values):
+                assert values.shape == (12, 1)
+                return regrid(values.reshape(-1), {"grid": "O1280"}, {"grid": [0.1, 0.1]}, "linear").reshape(-1, 1)
+
+        def find_matrix(in_grid, out_grid, method):
+            assert reader.closed
+            assert in_grid == {"grid": "O1280"} and out_grid == {"grid": [0.1, 0.1]} and method == "linear"
+            matrix_lookups.append(True)
+            matrix = Matrix()
+            matrix_references.append(weakref.ref(matrix))
+            return matrix, (2, 6)
 
         original_roll = np.roll
 
         def roll_after_regridding(*args, **kwargs):
             assert references and all(ref() is None for ref in references), "Native inputs retained during output conversion"
+            assert all(ref() is None for ref in matrix_references), "Weights retained during output conversion"
             return original_roll(*args, **kwargs)
 
         monkeypatch.setattr("librewxr.data.retry.retry_sync", lambda *args, **kwargs: reader)
         monkeypatch.setattr(module, "interpolate", regrid)
+        monkeypatch.setattr(module, "find_regrid_matrix", find_matrix)
         monkeypatch.setattr(module, "GRID_WIDTH", 6)
         monkeypatch.setattr(settings, "ecmwf_snow_ratio_threshold", 0.5)
         monkeypatch.setattr(np, "roll", roll_after_regridding)
@@ -1225,3 +1244,105 @@ class TestNativeTimestepBuffers:
         assert actual.dtype == np.uint8 and is_snow.dtype == bool
         assert accessed == (["precipitation", "snowfall_water_equivalent"] if has_snow else ["precipitation"])
         assert len(references) == (2 if has_snow else 1)
+        assert matrix_lookups == ([True] if has_snow else [])
+
+
+class TestSharedRegriddingMatrix:
+    @pytest.mark.parametrize("weight_dtype", [np.float32, np.float64], ids=["float32_weights", "float64_weights"])
+    def test_matches_public_interpolator_and_reloads_only_between_timesteps(
+        self, tmp_path, monkeypatch, weight_dtype,
+    ):
+        import importlib
+        import weakref
+        from scipy.sparse import csr_matrix
+        from earthkit.regrid import interpolate as reference_interpolate
+        from librewxr.sources.world.ifs import grid as module
+
+        fields = {
+            "precipitation": np.linspace(0, 10, 12, dtype=np.float32).reshape(2, 6),
+            "snowfall_water_equivalent": np.linspace(0, 8, 12, dtype=np.float32).reshape(2, 6),
+        }
+        for array in fields.values():array.flags.writeable = False
+        lookups, weights = [], []
+
+        def find_matrix(in_grid, out_grid, method):
+            assert in_grid == {"grid": "O1280"}
+            assert out_grid == {"grid": [0.1, 0.1]} and method == "linear"
+            # Two weighted neighbors per row exercise actual sparse arithmetic.
+            rows = np.repeat(np.arange(12), 2)
+            cols = np.column_stack([np.arange(12), (np.arange(12) + 1) % 12]).ravel()
+            coefficients = np.tile([0.25, 0.75], 12).astype(weight_dtype)
+            matrix = csr_matrix((coefficients, (rows, cols)), shape=(12, 12))
+            lookups.append(True)
+            weights.append(weakref.ref(matrix))
+            return matrix, (2, 6)
+
+        ek = importlib.import_module("earthkit.regrid.interpolate")
+        monkeypatch.setattr(ek, "find", find_matrix)
+        expected = [reference_interpolate(array.ravel(), in_grid={"grid": "O1280"},
+                                         out_grid={"grid": [0.1, 0.1]}, method="linear")
+                    for array in fields.values()]
+        lookups.clear()
+        weights.clear()
+
+        class Variable:
+            def __init__(self, name):self.name = name
+            def __getitem__(self, key):return fields[self.name][key]
+            def close(self):pass
+
+        class Reader:
+            def get_child_by_name(self, name):return Variable(name)
+            def close(self):pass
+
+        monkeypatch.setattr("librewxr.data.retry.retry_sync", lambda *args, **kwargs: Reader())
+        monkeypatch.setattr(module, "find_regrid_matrix", find_matrix)
+        monkeypatch.setattr(module, "interpolate", lambda *args, **kwargs: pytest.fail("Snow imports must share one matrix"))
+        monkeypatch.setattr(module, "GRID_WIDTH", 6)
+        monkeypatch.setattr(settings, "ecmwf_snow_ratio_threshold", 0.5)
+        original_roll = np.roll
+        observed = []
+
+        def checked_roll(array, *args, **kwargs):
+            assert all(ref() is None for ref in weights), "Weights retained during conversion"
+            np.testing.assert_array_equal(array, expected[len(observed) % 2])
+            observed.append(True)
+            return original_roll(array, *args, **kwargs)
+
+        monkeypatch.setattr(np, "roll", checked_roll)
+        grid = ECMWFGrid(cache_dir=tmp_path)
+        results = []
+        for index, vt in enumerate(["2026-11-08T12:00:00Z", "2026-11-08T13:00:00Z"], 1):
+            results.append(grid._fetch_one_timestep(None, "frozen", vt, True, []))
+            assert len(lookups) == index  # One lookup per import, no persistent cache.
+            assert all(ref() is None for ref in weights)
+        assert len(observed) == 4
+        for first, second in zip(*results):np.testing.assert_array_equal(first, second)
+        assert results[0][0].dtype == np.uint8 and results[0][1].dtype == bool
+
+    def test_missing_matrix_raises_after_reader_is_closed(self, tmp_path, monkeypatch):
+        from librewxr.sources.world.ifs import grid as module
+
+        class Variable:
+            def __getitem__(self, key):return np.zeros(12, dtype=np.float32)[key]
+            def close(self):pass
+
+        class Reader:
+            closed = False
+            def get_child_by_name(self, name):return Variable()
+            def close(self):self.closed = True
+
+        reader = Reader()
+        calls = []
+
+        def missing(in_grid, out_grid, method):
+            assert reader.closed
+            calls.append(True)
+            return None, None
+
+        monkeypatch.setattr("librewxr.data.retry.retry_sync", lambda *args, **kwargs: reader)
+        monkeypatch.setattr(module, "find_regrid_matrix", missing)
+        monkeypatch.setattr(module, "interpolate", lambda *args, **kwargs: pytest.fail("Missing matrix must fail"))
+        grid = ECMWFGrid(cache_dir=tmp_path)
+        with pytest.raises(ValueError, match="No O1280.*matrix found"):
+            grid._fetch_one_timestep(None, "frozen", "2026-11-08T12:00:00Z", True, [])
+        assert calls == [True] and reader.closed

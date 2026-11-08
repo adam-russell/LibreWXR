@@ -124,8 +124,9 @@ def _decode_msc_canada_png(data: bytes) -> np.ndarray | None:
     # materialize their large palette-axis buffers only for a bounded block.
     for start in range(0, len(pixels), _MSC_CANADA_DECODE_CHUNK_PIXELS):
         block = pixels[start:start + _MSC_CANADA_DECODE_CHUNK_PIXELS]
-        # Squared RGB distances overflow int16; retain int32 differences
-        # and NumPy's original sum dtype and first-minimum tie-breaking.
+        # RGB differences are at most 255, so three squared differences
+        # sum to at most 195075 and fit exactly in int32. Accumulate one
+        # channel at a time, preserving first-minimum tie-breaking.
         # Transparent output is already zero; skip its palette work entirely.
         visible = block[:, 3] > 0
         if not np.any(visible):
@@ -134,8 +135,13 @@ def _decode_msc_canada_png(data: bytes) -> np.ndarray | None:
         # Avoid a selection copy for fully visible blocks.
         block_visible = block if all_visible else block[visible]
         rgb = block_visible[:, :3].astype(np.int32)
-        diffs = rgb[:, None, :] - anchors_rgb[None, :, :]
-        dist2 = np.sum(diffs * diffs, axis=2)
+        dist2 = rgb[:, None, 0] - anchors_rgb[None, :, 0]
+        np.square(dist2, out=dist2)
+        for channel in (1, 2):
+            delta = rgb[:, None, channel] - anchors_rgb[None, :, channel]
+            np.square(delta, out=delta)
+            np.add(dist2, delta, out=dist2)
+            del delta
         nearest_idx = np.argmin(dist2, axis=1)
         nearest_dist2 = dist2[np.arange(len(block_visible)), nearest_idx]
         rate = anchors_rate[nearest_idx]

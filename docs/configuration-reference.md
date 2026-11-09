@@ -35,6 +35,7 @@ This document is the **full** reference for every setting LibreWXR understands. 
 - [Tile Request Tracking](#tile-request-tracking)
 - [MCP Server](#mcp-server)
 - [WebSocket Push Channel](#websocket-push-channel)
+- [Monitoring (Dashboard + Prometheus)](#monitoring-dashboard--prometheus)
 - [RAM Sizing Guide](#ram-sizing-guide)
 - [Example Configurations](#example-configurations)
 
@@ -1858,6 +1859,87 @@ Four topics are available: `weather-maps` (the `/public/weather-maps.json` paylo
 |---|---|
 | **Default** | `true` / `/v2/ws` |
 | **Type** | boolean / string |
+
+---
+
+## Monitoring (Dashboard + Prometheus)
+
+LibreWXR serves two read-only diagnostic surfaces on top of `/health`: a self-contained dashboard page that polls the endpoint from the browser, and a Prometheus text-exposition exporter over the same payload. Both are additive, both are served by every render worker, and neither is authenticated by the server itself - access control belongs to the reverse proxy. See [`dashboard.md`](dashboard.md) for the endpoint overview, the full metric-name table, scrape guidance, and nginx / Caddy / Traefik basic-auth snippets.
+
+### `LIBREWXR_DASHBOARD_ENABLED`
+
+Master switch for the health dashboard page. When `true` (the default), `GET /dashboard` serves a single packaged HTML asset that polls `/health` client-side, by default every 10 seconds; apart from the hot-tile map's MapLibre GL library (unpkg.com) and OpenFreeMap basemap tiles (tiles.openfreemap.org, with an automatic offline canvas fallback), it makes no external requests. When `false`, no route is mounted at all: a request is a plain `404`, the same semantics as the WebSocket channel. `/health` itself is unaffected.
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
+
+### `LIBREWXR_DASHBOARD_PATH`
+
+URL path the dashboard page is served on. Read at import time, so a change takes effect on the next restart. Change it if your reverse proxy already owns `/dashboard`, or to put the page under an internal prefix.
+
+| | |
+|---|---|
+| **Default** | `/dashboard` |
+| **Type** | string |
+
+### `LIBREWXR_METRICS_ENABLED`
+
+Master switch for the Prometheus exporter. When `true` (the default), `GET /metrics` renders the exact `/health` payload in Prometheus text-exposition 0.0.4 (`text/plain; version=0.0.4; charset=utf-8`). Every metric is a gauge; per-worker counters reset when the serving worker restarts. When `false`, no route is mounted at all (a plain `404`). No `prometheus_client` dependency is involved - the exposition is rendered from the health dict with stdlib code only.
+
+Building the health payload is moderately expensive (frame-store lock, tile-cache walk, pulse-file scan), so scrape at 15-60 second intervals and never below one second. See [`dashboard.md`](dashboard.md#prometheus-metrics) for the complete metric table and [`dashboard.md`](dashboard.md#per-worker-semantics) for which series are per-worker versus cluster-wide.
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
+
+### `LIBREWXR_METRICS_PATH`
+
+URL path the Prometheus exporter is served on. Read at import time, so a change takes effect on the next restart. Set it to something like `/internal/metrics` when `/metrics` is already claimed by another exporter on the same vhost.
+
+| | |
+|---|---|
+| **Default** | `/metrics` |
+| **Type** | string |
+
+### `LIBREWXR_TILE_HISTORY_ENABLED`
+
+Master switch for the tile-request history endpoint. When `true` (the default), every render worker snapshots its cumulative tile-request counters into a bounded in-memory ring and `GET /health/tile-history` serves that ring as JSON. Capture runs on its own cadence whether or not anyone views the dashboard or reads the endpoint. When `false`, no sampling task is started and no route is mounted at all (a plain `404`). `/health` and `/metrics` are unaffected.
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
+
+### `LIBREWXR_TILE_HISTORY_INTERVAL_S`
+
+Seconds between history snapshots. The retained window is `interval_s x max_entries`: the defaults (300 x 288) cover 24 hours per worker. The ring is per-worker and in-memory, so a worker restart resets its window; long-term history belongs to Prometheus via `/metrics`.
+
+| | |
+|---|---|
+| **Default** | `300` |
+| **Type** | integer |
+| **Unit** | seconds |
+
+### `LIBREWXR_TILE_HISTORY_MAX_ENTRIES`
+
+Maximum number of snapshots held in the per-worker ring. When full, the oldest snapshot is dropped. Together with `LIBREWXR_TILE_HISTORY_INTERVAL_S` this sets the window: `288` entries at `300` seconds is 24 hours.
+
+| | |
+|---|---|
+| **Default** | `288` |
+| **Type** | integer |
+
+### `LIBREWXR_TILE_HISTORY_PATH`
+
+URL path the tile-request history endpoint is served on. Read at import time, so a change takes effect on the next restart. Change it if your reverse proxy already owns `/health/tile-history`.
+
+| | |
+|---|---|
+| **Default** | `/health/tile-history` |
+| **Type** | string |
 
 ---
 

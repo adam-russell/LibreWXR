@@ -182,3 +182,63 @@ def test_websocket_env_overrides(monkeypatch):
     s = _fresh_settings(monkeypatch, mode="multi")
     assert s.websocket_enabled is False
     assert s.websocket_path == "/custom/ws"
+
+
+# ---------------------------------------------------------------------------
+# Monitoring endpoint settings (dashboard + Prometheus metrics)
+# ---------------------------------------------------------------------------
+
+def test_dashboard_metrics_defaults(monkeypatch):
+    """The dashboard and metrics endpoints are on by default."""
+    monkeypatch.delenv("LIBREWXR_DASHBOARD_ENABLED", raising=False)
+    monkeypatch.delenv("LIBREWXR_DASHBOARD_PATH", raising=False)
+    monkeypatch.delenv("LIBREWXR_METRICS_ENABLED", raising=False)
+    monkeypatch.delenv("LIBREWXR_METRICS_PATH", raising=False)
+    s = _fresh_settings(monkeypatch, mode="multi")
+    assert s.dashboard_enabled is True
+    assert s.dashboard_path == "/dashboard"
+    assert s.metrics_enabled is True
+    assert s.metrics_path == "/metrics"
+
+
+def test_dashboard_metrics_env_overrides(monkeypatch):
+    """LIBREWXR_DASHBOARD_* / LIBREWXR_METRICS_* drive enable + mount path."""
+    monkeypatch.setenv("LIBREWXR_DASHBOARD_ENABLED", "false")
+    monkeypatch.setenv("LIBREWXR_DASHBOARD_PATH", "/x")
+    monkeypatch.setenv("LIBREWXR_METRICS_ENABLED", "false")
+    monkeypatch.setenv("LIBREWXR_METRICS_PATH", "/y")
+    s = _fresh_settings(monkeypatch, mode="multi")
+    assert s.dashboard_enabled is False
+    assert s.dashboard_path == "/x"
+    assert s.metrics_enabled is False
+    assert s.metrics_path == "/y"
+
+
+# ---------------------------------------------------------------------------
+# Tile-request history settings
+# ---------------------------------------------------------------------------
+
+def test_tile_history_defaults(monkeypatch):
+    """The history endpoint is on by default with a 24h window."""
+    monkeypatch.delenv("LIBREWXR_TILE_HISTORY_ENABLED", raising=False)
+    monkeypatch.delenv("LIBREWXR_TILE_HISTORY_INTERVAL_S", raising=False)
+    monkeypatch.delenv("LIBREWXR_TILE_HISTORY_MAX_ENTRIES", raising=False)
+    monkeypatch.delenv("LIBREWXR_TILE_HISTORY_PATH", raising=False)
+    s = _fresh_settings(monkeypatch, mode="multi")
+    assert s.tile_history_enabled is True
+    assert s.tile_history_interval_s == 300
+    assert s.tile_history_max_entries == 288
+    assert s.tile_history_path == "/health/tile-history"
+
+
+def test_tile_history_env_overrides(monkeypatch):
+    """LIBREWXR_TILE_HISTORY_* drive enable, cadence, ring size, path."""
+    monkeypatch.setenv("LIBREWXR_TILE_HISTORY_ENABLED", "false")
+    monkeypatch.setenv("LIBREWXR_TILE_HISTORY_INTERVAL_S", "60")
+    monkeypatch.setenv("LIBREWXR_TILE_HISTORY_MAX_ENTRIES", "120")
+    monkeypatch.setenv("LIBREWXR_TILE_HISTORY_PATH", "/x/history")
+    s = _fresh_settings(monkeypatch, mode="multi")
+    assert s.tile_history_enabled is False
+    assert s.tile_history_interval_s == 60
+    assert s.tile_history_max_entries == 120
+    assert s.tile_history_path == "/x/history"

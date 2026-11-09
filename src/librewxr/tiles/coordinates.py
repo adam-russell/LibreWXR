@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Joshua Kimsey
 import logging
 import math
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -852,9 +853,9 @@ def compute_blur_radius(
 ) -> float:
     """Pick a Gaussian blur radius matched to the visible region pixel size.
 
-    Reads the local Jacobian of ``region_pixel_indices_fractional`` at the
-    tile centre to find how many tile pixels a single region pixel covers
-    (``tile_per_region``).  Blur radius scales as a quarter of that span,
+    Samples a 3×3 neighborhood at the tile centre to find how many tile
+    pixels a single region pixel covers (``tile_per_region``). Blur radius
+    scales as a quarter of that span,
     which is the σ that rounds a single region-pixel "block" at its
     edges without merging it with its neighbours (the visible Gaussian
     width is ~3σ, so a quarter-block σ touches half a block on each side).
@@ -863,13 +864,35 @@ def compute_blur_radius(
     growth is capped at ``tile_size / 32`` to keep the kernel from
     smearing unrelated cells together.
     """
-    base = settings.smooth_radius
+    return _cached_blur_radius(region, z, x, y, tile_size, settings.smooth_radius)
+
+
+@lru_cache(maxsize=settings.coord_cache_size)
+def _cached_blur_radius(
+    region: RegionDef, z: int, x: int, y: int, tile_size: int, base: float,
+) -> float:
+    """Retain only the scalar radius, including live configuration in its key."""
     if base <= 0:
         return 0.0
-    row_f, col_f = region_pixel_indices_fractional(region, z, x, y, tile_size)
-    cy = cx = tile_size // 2
-    drow = abs(float(row_f[cy + 1, cx] - row_f[cy - 1, cx])) / 2.0
-    dcol = abs(float(col_f[cy, cx + 1] - col_f[cy, cx - 1])) / 2.0
+    # Keep the full-map pixel-center arithmetic and float32 rounding exactly,
+    # but project only the three rows/columns surrounding the centre.
+    axis = np.arange(tile_size // 2 - 1, tile_size // 2 + 2, dtype=np.float64) + 0.5
+    n = 2**z
+    lon = (x + axis / tile_size) / n * 360.0 - 180.0
+    lat = np.degrees(np.arctan(np.sinh(math.pi * (1 - 2 * (y + axis / tile_size) / n))))
+    if region.proj == "laea":
+        col_grid, row_grid = _laea_pixel_coords(lon, lat, region)
+    elif region.proj == "tmerc":
+        col_grid, row_grid = _tmerc_pixel_coords(lon, lat, region)
+    else:
+        col_grid, row_grid = np.meshgrid(
+            (lon - region.west) / region.pixel_size,
+            (region.north - lat) / region._ps_y,
+        )
+    row_f = np.clip(row_grid, 0, region.height - 1).astype(np.float32)
+    col_f = np.clip(col_grid, 0, region.width - 1).astype(np.float32)
+    drow = abs(float(row_f[2, 1] - row_f[0, 1])) / 2.0
+    dcol = abs(float(col_f[1, 2] - col_f[1, 0])) / 2.0
     if drow < 1e-6 or dcol < 1e-6:
         return base
     tile_per_region = max(1.0 / drow, 1.0 / dcol)
@@ -927,10 +950,11 @@ ALL_CACHES = [
     region_pixel_indices_fractional_padded,
     tile_pixel_latlons,
     tile_pixel_latlons_padded,
+    _cached_blur_radius,
 ]
 
-# Per-cache estimate of how many bytes each cached result tuple consumes.
-# Calculated as: 2 arrays × dtype_size × rows × cols.
+# Per-cache estimate of cached payload bytes, excluding key/container overhead.
+# Array tuples: 2 arrays × dtype_size × rows × cols; scalar radius: float size.
 # Defaults assume tile_size=256, pad=8 (padded: 272).
 _CACHE_ENTRY_BYTES = {
     # region_pixel_indices: 2 × int32 × 256 × 256
@@ -945,6 +969,8 @@ _CACHE_ENTRY_BYTES = {
     tile_pixel_latlons: 2 * 4 * 256 * 256,
     # tile_pixel_latlons_padded: 2 × float32 × 272 × 272
     tile_pixel_latlons_padded: 2 * 4 * 272 * 272,
+    # Scalar payload only; cache key/container overhead is excluded throughout.
+    _cached_blur_radius: sys.getsizeof(0.0),
 }
 
 

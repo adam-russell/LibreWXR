@@ -51,11 +51,11 @@ def build_sampling_plan(
     if tile_size <= 0 or pad < 0 or region.height <= 0 or region.width <= 0:
         raise ValueError("Invalid sampling dimensions")
     separable = region.proj not in ("laea", "tmerc")
+    axis = np.arange(-pad, tile_size + pad, dtype=np.float64) + 0.5
+    n = 2**z
+    lon = (x + axis / tile_size) / n * 360.0 - 180.0
+    lat = np.degrees(np.arctan(np.sinh(math.pi * (1 - 2 * (y + axis / tile_size) / n))))
     if separable:
-        axis = np.arange(-pad, tile_size + pad, dtype=np.float64) + 0.5
-        n = 2**z
-        lon = (x + axis / tile_size) / n * 360.0 - 180.0
-        lat = np.degrees(np.arctan(np.sinh(math.pi * (1 - 2 * (y + axis / tile_size) / n))))
         raw_r = (region.north - lat) / region._ps_y
         raw_c = (lon - region.west) / region.pixel_size
         rounded_r, rounded_c = np.rint(raw_r), np.rint(raw_c)
@@ -64,21 +64,23 @@ def build_sampling_plan(
         row_f = np.clip(raw_r, 0, region.height - 1).astype(np.float32)
         col_f = np.clip(raw_c, 0, region.width - 1).astype(np.float32)
     else:
-        # Projected coordinates are not separable. Build their exact existing
-        # maps without also pinning a duplicate in the coordinate LRUs.
-        if pad:
-            row_f, col_f = coordinates._compute_region_pixel_indices_fractional_padded(
-                region, z, x, y, tile_size, pad,
-            )
-            row_i, col_i = coordinates._compute_region_pixel_indices_padded(
-                region, z, x, y, tile_size, pad,
-            )
+        # Derive interpolation weights and the original joint OOB mask from
+        # one projection, without pinning duplicate coordinate maps in LRUs.
+        if region.proj == "laea":
+            col_grid, row_grid = coordinates._laea_pixel_coords(lon, lat, region)
         else:
-            row_f, col_f = coordinates._compute_region_pixel_indices_fractional(
-                region, z, x, y, tile_size,
-            )
-            row_i, col_i = coordinates._compute_region_pixel_indices(region, z, x, y, tile_size)
-        valid_rows, valid_cols = row_i >= 0, col_i >= 0
+            col_grid, row_grid = coordinates._tmerc_pixel_coords(lon, lat, region)
+        row_i = np.rint(row_grid).astype(np.int32)
+        col_i = np.rint(col_grid).astype(np.int32)
+        valid_rows = (
+            (row_i >= 0) & (row_i < region.height)
+            & (col_i >= 0) & (col_i < region.width)
+        )
+        valid_cols = valid_rows.copy()
+        del row_i, col_i
+        row_f = np.clip(row_grid, 0, region.height - 1).astype(np.float32)
+        col_f = np.clip(col_grid, 0, region.width - 1).astype(np.float32)
+        del row_grid, col_grid
 
     r0 = np.floor(row_f).astype(np.int32)
     c0 = np.floor(col_f).astype(np.int32)

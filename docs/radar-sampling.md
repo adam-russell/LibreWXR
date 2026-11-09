@@ -5,6 +5,16 @@ Regular latitude/longitude sources use compact row and column vectors;
 LAEA and transverse-Mercator sources retain exact two-dimensional plans.
 The key includes the full immutable source definition, tile coordinates,
 tile size and smoothing padding. Plans contain no weather values.
+Projected plans derive weights and validity masks from a single projection,
+with the same rounding and clipping as the separate coordinate maps.
+
+Adaptive smoothing computes its radius from a 3×3 centre sample instead of
+allocating a full tile coordinate map. A per-worker scalar LRU is bounded by
+`LIBREWXR_COORD_CACHE_SIZE` and keyed by the source, tile, size, and configured
+base radius. It is reported as `_cached_blur_radius` in coordinate-cache health
+stats and cleared with those caches under memory pressure. Cached payload
+accounting includes the scalar values; as with the array caches, it excludes
+Python cache-key and container overhead.
 
 Each rendering worker retains at most 32 plans and 32 MiB of plan arrays.
 Oversized plans are used for the request without being retained. Plans are

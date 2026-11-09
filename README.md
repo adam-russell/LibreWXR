@@ -223,7 +223,10 @@ cache defaults, and logs a startup warning. See
 
 ### Manual
 
-Requires Python 3.11+.
+Requires Python 3.11+. Installation builds the optional native radar
+sampler when a C compiler and Python headers are available, and otherwise
+uses NumPy. Docker builds require the native sampler. See
+[Radar sampling and builds](docs/radar-sampling.md).
 
 ```bash
 git clone https://github.com/JoshuaKimsey/LibreWXR.git

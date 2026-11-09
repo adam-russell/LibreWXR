@@ -13,3 +13,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .mypy_cache/
+
+# Build native extensions for the target image, never copy host artifacts.
+src/librewxr/tiles/_sampling_native*.so
+src/librewxr/tiles/_sampling_native*.pyd

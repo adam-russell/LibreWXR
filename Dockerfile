@@ -1,13 +1,22 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS wheel-builder
 
-WORKDIR /app
-
-COPY pyproject.toml .
-COPY LICENSE ./
+WORKDIR /build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY pyproject.toml hatch_build.py LICENSE ./
 COPY src/ src/
+# Fail the image build rather than silently shipping without the measured
+# native sampler. Keep compilers/headers out of the final runtime image.
+RUN LIBREWXR_REQUIRE_NATIVE=1 pip wheel --no-deps --no-cache-dir --wheel-dir /wheels .
 
-# Install with the [mcp] extra so the MCP HTTP transport mounts on startup.
-RUN pip install --no-cache-dir '.[mcp]'
+FROM python:3.12-slim
+WORKDIR /app
+COPY --from=wheel-builder /wheels /wheels
+# Install the built wheel with MCP enabled, without copying compiler tools.
+RUN set -- /wheels/librewxr-*.whl \
+    && pip install --no-cache-dir "${1}[mcp]" \
+    && rm -rf /wheels
 
 LABEL org.opencontainers.image.title="LibreWXR" \
       org.opencontainers.image.description="Self-hostable Rain Viewer API replacement - radar composites from public sources, served as a Rain Viewer-compatible JSON/tile API." \

@@ -940,3 +940,17 @@ def psutil_rss_mb() -> float:
     import psutil
 
     return round(psutil.Process().memory_info().rss / (1024 * 1024), 1)
+
+
+def test_health_counts_private_sampling_plans_with_shared_coordinates(client, monkeypatch):
+    c, _, _ = client
+    store_stats = {"hits": 0, "misses": 0, "publishes": 0, "entries": 3, "bytes": 3 * 1024**2}
+    monkeypatch.setattr(
+        routes, "coord_cache_stats",
+        lambda: {"max_size": 32, "caches": {"sampling_plans": {"bytes": 2 * 1024**2}}, "store": store_stats},
+    )
+    response = c.get("/health")
+    assert response.status_code == 200
+    breakdown = response.json()["memory"]["breakdown"]
+    assert breakdown["coord_caches_mb"] == 2.0
+    assert breakdown["coord_store_mb"] == 3.0

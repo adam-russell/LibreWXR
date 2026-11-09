@@ -968,6 +968,9 @@ def coord_cache_stats() -> dict:
             "misses": info.misses,
             "hit_ratio": round(info.hits / total, 3) if total else None,
         }
+    from librewxr.tiles.sampling import sampling_plans
+
+    caches["sampling_plans"] = sampling_plans.stats()
     return {
         "max_size": max_size,
         "caches": caches,
@@ -992,4 +995,7 @@ def coord_cache_bytes() -> int:
     for fn in ALL_CACHES:
         info = fn.cache_info()
         total += info.currsize * _CACHE_ENTRY_BYTES[fn]
+    from librewxr.tiles.sampling import sampling_plans
+
+    total += sampling_plans.stats()["bytes"]
     return total

@@ -22,7 +22,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install dependencies
+      - name: Install dependencies with native sampler
+        env:
+          LIBREWXR_REQUIRE_NATIVE: "1"
         run: pip install -e ".[dev,mcp]"
       - name: Run tests
         run: pytest -q
+      - name: Check NumPy renderer fallback
+        run: |
+          LIBREWXR_DISABLE_NATIVE=1 pip install --no-deps -e .
+          pytest -q tests/test_sampling.py tests/test_renderer.py

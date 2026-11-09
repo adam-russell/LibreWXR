@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+# Generated optional native sampler (editable installs)
+src/librewxr/tiles/_sampling_native*.so
+src/librewxr/tiles/_sampling_native*.pyd
 dist/
 build/
 

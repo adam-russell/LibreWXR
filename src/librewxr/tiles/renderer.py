@@ -19,13 +19,13 @@ from librewxr.tiles.coordinates import (
     overlapping_regions,
     region_pixel_indices,
     region_pixel_indices_fractional,
-    region_pixel_indices_fractional_padded,
     region_pixel_indices_padded,
     tile_bounds,
     tile_pixel_latlons,
     tile_pixel_latlons_padded,
 )
 from librewxr.tiles.png_palette import encode_png
+from librewxr.tiles.sampling import sample_bilinear
 
 if TYPE_CHECKING:
     from librewxr.data.precip_mask import PrecipMaskStore
@@ -557,27 +557,13 @@ def _sample_region(
     pad: int,
 ) -> np.ndarray:
     """Sample pixel values from a single region."""
+    if smooth:
+        return _bilinear_sample(frame_data, region, z, x, y, tile_size, pad=pad)
     if pad > 0:
-        row_idx, col_idx = region_pixel_indices_padded(
-            region, z, x, y, tile_size, pad
-        )
-        if smooth:
-            values = _bilinear_sample(
-                frame_data, region, z, x, y, tile_size, pad=pad,
-            )
-            oob = (row_idx == -1) | (col_idx == -1)
-            values[oob] = 0
-        else:
-            values = _gather_clipped(frame_data, row_idx, col_idx)
+        row_idx, col_idx = region_pixel_indices_padded(region, z, x, y, tile_size, pad)
     else:
         row_idx, col_idx = region_pixel_indices(region, z, x, y, tile_size)
-        if smooth:
-            values = _bilinear_sample(frame_data, region, z, x, y, tile_size)
-            oob = (row_idx == -1) | (col_idx == -1)
-            values[oob] = 0
-        else:
-            values = _gather_clipped(frame_data, row_idx, col_idx)
-    return values
+    return _gather_clipped(frame_data, row_idx, col_idx)
 
 
 def _composite_regions(
@@ -618,21 +604,9 @@ def _composite_regions(
         if data is None:
             continue
 
-        if pad > 0:
-            row_idx, col_idx = region_pixel_indices_padded(
-                region, z, x, y, tile_size, pad
-            )
-        else:
-            row_idx, col_idx = region_pixel_indices(region, z, x, y, tile_size)
-
-        if smooth:
-            region_values = _bilinear_sample(
-                data, region, z, x, y, tile_size, pad=pad,
-            )
-            oob = (row_idx == -1) | (col_idx == -1)
-            region_values[oob] = 0
-        else:
-            region_values = _gather_clipped(data, row_idx, col_idx)
+        region_values = _sample_region(
+            data, region, z, x, y, tile_size, smooth, use_blur, pad,
+        )
 
         # Fill: only where no higher-priority region has claimed the
         # pixel AND this region actually has data there.
@@ -853,44 +827,8 @@ def _bilinear_sample(
     z: int, x: int, y: int, tile_size: int,
     pad: int = 0,
 ) -> np.ndarray:
-    """Sample frame data using bilinear interpolation for smooth rendering."""
-    if pad > 0:
-        row_f, col_f = region_pixel_indices_fractional_padded(
-            region, z, x, y, tile_size, pad
-        )
-    else:
-        row_f, col_f = region_pixel_indices_fractional(region, z, x, y, tile_size)
-
-    r0 = np.floor(row_f).astype(np.int32)
-    c0 = np.floor(col_f).astype(np.int32)
-    r1 = np.minimum(r0 + 1, region.height - 1)
-    c1 = np.minimum(c0 + 1, region.width - 1)
-
-    # Fractional offsets must stay float32: the four corner values are
-    # float32, and without the cast the int32 subtract would promote the
-    # whole interpolation to float64.  The final clip + 0.5 -> uint8
-    # rounding is unchanged.
-    dr = (row_f - r0).astype(np.float32)
-    dc = (col_f - c0).astype(np.float32)
-
-    v00 = frame_data[r0, c0].astype(np.float32)
-    v01 = frame_data[r0, c1].astype(np.float32)
-    v10 = frame_data[r1, c0].astype(np.float32)
-    v11 = frame_data[r1, c1].astype(np.float32)
-
-    any_zero = (v00 == 0) | (v01 == 0) | (v10 == 0) | (v11 == 0)
-
-    interp = (
-        v00 * (1 - dr) * (1 - dc)
-        + v01 * (1 - dr) * dc
-        + v10 * dr * (1 - dc)
-        + v11 * dr * dc
-    )
-
-    nearest = v00
-    result = np.where(any_zero, nearest, interp)
-
-    return np.clip(result + 0.5, 0, 255).astype(np.uint8)
+    """Bilinear sample with reusable geometry, zeroing out-of-region pixels."""
+    return sample_bilinear(frame_data, region, z, x, y, tile_size, pad)
 
 
 def _sample_flow_at(

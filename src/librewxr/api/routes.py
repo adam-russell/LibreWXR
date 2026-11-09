@@ -515,9 +515,9 @@ async def health():
     store_stats = coord_stats.get("store")
     if store_stats is not None:
         # Store-backed: entries are shared read-only memmap pages, not private
-        # heap - report the on-disk footprint separately, contribute 0 to RSS
-        # reconciliation.
-        coord_bytes = 0
+        # heap - report the on-disk footprint separately. Sampling plans are
+        # private heap even when the coordinate maps use the shared store.
+        coord_bytes = coord_stats.get("caches", {}).get("sampling_plans", {}).get("bytes", 0)
     else:
         coord_bytes = coord_cache_bytes()
     tracked_bytes = (

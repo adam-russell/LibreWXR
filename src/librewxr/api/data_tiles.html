@@ -1,0 +1,30 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Radar coloring comparison</title>
+<style>body{font:16px system-ui;margin:24px;background:#eee;color:#111}label{display:inline-block;margin:6px}input{width:90px}button,select,input{font:inherit}section{display:flex;gap:20px;flex-wrap:wrap}canvas{max-width:100%;background:repeating-conic-gradient(#999 0% 25%,#bbb 0% 50%) 0/24px 24px}p{max-width:1000px}pre{white-space:pre-wrap}body.dark{background:#172330;color:#eee}body.dark canvas{background:#263c50}</style>
+<h1>Radar coloring comparison</h1><p>Experimental comparison only. Left: current server PNG. Right: numeric tile colored here. Opacity is 85%. These are neutral backgrounds, not TidesPro map screenshots. Browser processing times are diagnostic and do not predict native GPU performance.</p>
+<label>Timestamp <input id="timestamp" value="0"></label><label>Zoom <input id="z" value="7"></label><label>X <input id="x" value="41"></label><label>Y <input id="y" value="46"></label><label>Palette <select id="palette"></select></label><button id="load">Compare</button><button id="theme">Light/dark</button>
+<section><div><h2>Server-colored PNG</h2><canvas id="server" width="512" height="512"></canvas></div><div><h2>Client-colored data</h2><canvas id="client" width="512" height="512"></canvas></div></section><pre id="status" role="status">Loading palettes…</pre>
+<script src="/experimental/radar-data/client.js"></script><script>
+const $=id=>document.getElementById(id); let generation=0, dataKey=null, tile=null;
+const palettes=new Map();
+$('theme').onclick=()=>document.body.classList.toggle('dark');
+async function checked(url){const r=await fetch(url);if(!r.ok)throw Error(`${r.status}: ${url}`);return r;}
+async function compare(){const gen=++generation; try {
+  $('status').textContent='Rendering…';
+  const scheme=$('palette').value,z=$('z').value,x=$('x').value,y=$('y').value,ts=$('timestamp').value;
+  // Resolve latest once so both requests refer to exactly the same frame.
+  const key=`${ts}/512/${z}/${x}/${y}/1_1`;
+  let selected=tile, numericBytes=0,decodeMs=0;
+  if(dataKey!==key){const r=await checked(`/experimental/radar-data/${key}.lwxr`),buffer=await r.arrayBuffer();numericBytes=buffer.byteLength;const t=performance.now();selected=await RadarData.decode(buffer);decodeMs=performance.now()-t;selected.resolved=r.headers.get('X-Frame-Timestamp');selected.bytes=numericBytes;if(gen===generation){tile=selected;dataKey=key;}}
+  let palette=palettes.get(scheme);if(!palette){palette=await (await checked(`/experimental/radar-data/palettes/${scheme}.json`)).json();palettes.set(scheme,palette);}
+  const t=performance.now(),rgba=RadarData.colorize(selected,palette),colorMs=performance.now()-t;
+  const r=await checked(`/v2/radar/${selected.resolved}/512/${z}/${x}/${y}/${scheme}/1_1.png`),blob=await r.blob(),bitmap=await createImageBitmap(blob);
+  if(gen!==generation){bitmap.close();return;}
+  for(const id of ['server','client']){const c=$(id).getContext('2d');c.clearRect(0,0,512,512);c.globalAlpha=.85;}
+  $('server').getContext('2d').drawImage(bitmap,0,0);bitmap.close();
+  const off=document.createElement('canvas');off.width=off.height=512;off.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(rgba),512,512),0,0);$('client').getContext('2d').drawImage(off,0,0);
+  $('status').textContent=`Frame ${selected.resolved}. PNG ${blob.size} bytes; numeric ${selected.bytes} bytes (plus palette once). Decode ${decodeMs.toFixed(1)} ms; color/blur ${colorMs.toFixed(1)} ms. Palette changes reuse numeric data. Exact RGBA fidelity is checked by automated tests before canvas alpha conversion.`;
+}catch(e){if(gen===generation)$('status').textContent=e.message;}}
+$('load').onclick=()=>{dataKey=null;compare();};$('palette').onchange=compare;
+checked('/experimental/radar-data').then(r=>r.json()).then(d=>{for(const [id,name]of Object.entries(d.schemes))$('palette').add(new Option(`${id}: ${name}`,id));$('palette').value='2';$('status').textContent='Choose a wet tile and compare.';}).catch(e=>$('status').textContent=e.message);
+</script></html>

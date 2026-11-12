@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     websocket_enabled: bool = True
     websocket_path: str = "/v2/ws"
 
+    # Experimental palette-independent transport and isolated comparison client.
+    experimental_data_tiles_enabled: bool = False
+
     # Operational monitoring endpoints.  ``dashboard_path`` serves the
     # self-contained health dashboard page (a single offline HTML asset
     # that polls /health client-side); ``metrics_path`` serves the same

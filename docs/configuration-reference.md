@@ -597,6 +597,13 @@ Each zoom level adds ~4x the tiles of the previous (zoom 6 = ~5,500 tiles).
 
 ---
 
+### `LIBREWXR_EXPERIMENTAL_DATA_TILES_ENABLED`
+
+`LIBREWXR_EXPERIMENTAL_DATA_TILES_ENABLED` defaults to `false`. Enables the
+additional palette-independent tile transport and isolated comparison client;
+the existing colored tile API stays available. See [client coloring](client-coloring.md)
+for the experimental protocol, limitations, and Linux benchmark.
+
 ## Deployment Mode, Workers, and Memory
 
 ### `COMPOSE_PROFILES` / `LIBREWXR_MODE`

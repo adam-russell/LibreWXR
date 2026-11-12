@@ -1200,6 +1200,10 @@ app.add_middleware(
 
 app.include_router(routes.router)
 
+if settings.experimental_data_tiles_enabled:
+    from librewxr.api.data_tiles import router as data_tiles_router
+    app.include_router(data_tiles_router)
+
 if settings.dashboard_enabled:
     app.include_router(dashboard_router)
 

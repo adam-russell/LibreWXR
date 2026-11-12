@@ -100,6 +100,8 @@ def client(monkeypatch):
     monkeypatch.setattr(routes,'shared_tile_store',None)
     monkeypatch.setattr(routes,'present_executor',None)
     monkeypatch.setattr(routes,'io_executor',None)
+    # Geometry is supplied by this fixture rather than geographic sampling.
+    monkeypatch.setattr(api,'_blank_label',Mock(return_value=None))
     monkeypatch.setattr(api,'compute_tile_geometry',lambda **kwargs:geometry(256,1.5))
     app=FastAPI();app.include_router(routes.router);app.include_router(api.router)
     return TestClient(app)

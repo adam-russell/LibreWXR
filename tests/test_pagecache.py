@@ -18,6 +18,13 @@ import pytest
 from librewxr.data import pagecache
 
 
+@pytest.fixture
+def fadvise_api(monkeypatch):
+    """Provide the mocked Linux API even on macOS; never call the kernel."""
+    monkeypatch.setattr(pagecache.os, "posix_fadvise", lambda *args: None, raising=False)
+    monkeypatch.setattr(pagecache.os, "POSIX_FADV_WILLNEED", 3, raising=False)
+
+
 def test_collect_memmap_files_frame_store():
     payload = {
         "memmap_dir": "/tmp/radar",
@@ -77,7 +84,7 @@ def test_collect_memmap_files_ignores_non_memmap_and_dedupes():
     }
 
 
-def test_prime_fresh_memmaps_end_to_end(tmp_path, monkeypatch):
+def test_prime_fresh_memmaps_end_to_end(tmp_path, monkeypatch, fadvise_api):
     cache_dir = tmp_path / "cache"
     radar_dir = cache_dir / "radar"
     radar_dir.mkdir(parents=True)
@@ -134,7 +141,7 @@ def test_prime_fresh_memmaps_end_to_end(tmp_path, monkeypatch):
     assert {fd_to_path[fd] for fd in advised} == {str(f1)}
 
 
-def test_prime_fresh_memmaps_missing_file_and_corrupt_record(tmp_path, monkeypatch):
+def test_prime_fresh_memmaps_missing_file_and_corrupt_record(tmp_path, monkeypatch, fadvise_api):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     # Corrupt the priming record file first.
@@ -160,8 +167,14 @@ def test_prime_fresh_memmaps_missing_file_and_corrupt_record(tmp_path, monkeypat
     assert json.loads(record.read_text()) == {}
 
 
-def test_prime_fresh_memmaps_without_stores(tmp_path, monkeypatch):
+def test_prime_fresh_memmaps_without_stores(tmp_path, monkeypatch, fadvise_api):
     advised = []
     monkeypatch.setattr(pagecache.os, "posix_fadvise", lambda *args: advised.append(args))
     assert pagecache.prime_fresh_memmaps({"version": 1, "written_at": 0}, tmp_path) == 0
     assert advised == []
+
+
+def test_prime_fresh_memmaps_without_platform_api(tmp_path, monkeypatch):
+    monkeypatch.delattr(pagecache.os, "posix_fadvise", raising=False)
+    assert pagecache.prime_fresh_memmaps({"stores": {}}, tmp_path) == 0
+    assert not (tmp_path / "primed_memmaps.json").exists()

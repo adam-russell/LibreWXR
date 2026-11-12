@@ -42,6 +42,8 @@ async def context(tmp_path, monkeypatch):
         snow = (xx + yy) % 19 == 0 if kwargs['snow'] else None
         return TileGeometry(values, snow, size, pad, 1.1 if kwargs['smooth'] else 0.)
     state['compute'] = Mock(side_effect=geometry)
+    # Cache tests supply wet geometry; blank decisions have their own suite.
+    monkeypatch.setattr(api, '_blank_label', Mock(return_value=None))
     monkeypatch.setattr(api, 'compute_tile_geometry', state['compute'])
     app = FastAPI(); app.include_router(api.router)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://numeric-test') as client:

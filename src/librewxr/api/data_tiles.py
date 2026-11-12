@@ -2,6 +2,7 @@
 """Opt-in prototype. The normal colored API remains independent of this router."""
 import asyncio
 import json
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -12,10 +13,27 @@ from librewxr.colors import schemes
 from librewxr.config import settings
 from librewxr.tiles.cache import CachedRender
 from librewxr.tiles.data_tiles import COMPRESSION_LEVEL, MEDIA_TYPE, encode_data_tile
-from librewxr.tiles.renderer import compute_tile_geometry
+from librewxr.tiles.renderer import compute_tile_geometry, TileGeometry, transparent_fast_path_label
+from librewxr.tiles.coordinates import tile_bounds
 
 router = APIRouter(prefix="/experimental/radar-data", include_in_schema=False)
 ASSETS = Path(__file__).parent
+
+
+def _blank_label(regions, z, x, y, enabled, nwp, mask, timestamp, blend):
+    # The existing NWP-only geometry path applies this same conservative
+    # mask gate. Hoist it too, so ocean tiles without radar-region arrays
+    # do not need a compute-thread hop just to discover that they are empty.
+    if nwp is not None and nwp.has_data() and mask is not None:
+        if not mask.has_precip_in_bbox(timestamp, tile_bounds(z, x, y)):
+            return "tier2_mask_numeric"
+    return transparent_fast_path_label(regions,z,x,y,enabled,nwp,mask,timestamp,blend)
+
+
+@lru_cache(maxsize=2)
+def _blank_render(size: int) -> CachedRender:
+    """One immutable encoded empty response per supported tile size."""
+    return _encode(TileGeometry.transparent(size))
 
 
 @router.get("")
@@ -84,6 +102,9 @@ async def data_tile(request: Request, timestamp: int, size: int, z: int, x: int,
     # A refresh can happen while disk I/O or encoding is awaited. Retry once
     # against the new frame version instead of serving/caching the old bytes.
     for _ in range(2):
+        frame_loaded = False
+        frame = None
+        blend = None
         version = routes.frame_store.frame_version(timestamp)
         encoded_key = (*key, "data-v1", "zlib", COMPRESSION_LEVEL, "numeric", version)
         shared_store = routes.shared_tile_store
@@ -94,6 +115,26 @@ async def data_tile(request: Request, timestamp: int, size: int, z: int, x: int,
         # Legacy/unversioned and nowcast frames retain the geometry gate and
         # existing poller invalidation; they never enter the shared store.
         cached = routes.tile_cache.get(encoded_key) if version is not None or geom is not None else None
+        if not isinstance(cached, CachedRender):
+            if geom is None or version is None:
+                frame = await routes.frame_store.get_frame(timestamp)
+                if frame is None and routes.nowcast_store is not None:
+                    frame, blend = await routes.nowcast_store.get_frame(timestamp)
+                if frame is None:
+                    raise HTTPException(404, "Frame not found")
+                frame_loaded = True
+                if routes.frame_store.frame_version(timestamp) != version:
+                    continue
+                label = _blank_label(
+                    frame.regions, z, x, y, routes.enabled_regions,
+                    routes.nwp_chain, routes.precip_mask, timestamp, blend)
+                if routes.frame_store.frame_version(timestamp) != version:
+                    continue
+                if label is not None:
+                    geom = TileGeometry.transparent(size, fast_path=label)
+                    routes.tile_cache.put(key, geom)
+            if geom is not None and geom.is_transparent:
+                cached = _blank_render(size)
         if not isinstance(cached, CachedRender) and shared_key is not None:
             hit = await _shared_io(routes._shared_get_and_hash, shared_store, shared_key)
             if routes.frame_store.frame_version(timestamp) != version:
@@ -102,12 +143,13 @@ async def data_tile(request: Request, timestamp: int, size: int, z: int, x: int,
                 cached = CachedRender(*hit)
         if not isinstance(cached, CachedRender):
             if geom is None:
-                frame = await routes.frame_store.get_frame(timestamp)
-                blend = None
-                if frame is None and routes.nowcast_store is not None:
-                    frame, blend = await routes.nowcast_store.get_frame(timestamp)
-                if frame is None:
-                    raise HTTPException(404, "Frame not found")
+                if not frame_loaded:
+                    frame = await routes.frame_store.get_frame(timestamp)
+                    blend = None
+                    if frame is None and routes.nowcast_store is not None:
+                        frame, blend = await routes.nowcast_store.get_frame(timestamp)
+                    if frame is None:
+                        raise HTTPException(404, "Frame not found")
                 if routes.frame_store.frame_version(timestamp) != version:
                     continue
                 geom = await asyncio.to_thread(
@@ -119,16 +161,19 @@ async def data_tile(request: Request, timestamp: int, size: int, z: int, x: int,
                 if routes.frame_store.frame_version(timestamp) != version:
                     continue
                 routes.tile_cache.put(key, geom)
-            if routes.present_executor is not None:
-                cached = await asyncio.get_running_loop().run_in_executor(routes.present_executor, _encode, geom)
+            if geom.is_transparent:
+                # Also reuse the constant for emptiness discovered only after
+                # sampling. Those tiles still pay their compute/disk lookup.
+                cached = _blank_render(size)
             else:
-                cached = await asyncio.to_thread(_encode, geom)
-            if routes.frame_store.frame_version(timestamp) != version:
-                continue
-            if shared_key is not None:
-                # Await publication as benchmarked: the first response pays
-                # for its write and another worker can reuse it immediately.
-                await _shared_io(shared_store.publish, shared_key, cached.data)
+                if routes.present_executor is not None:
+                    cached = await asyncio.get_running_loop().run_in_executor(routes.present_executor, _encode, geom)
+                else:
+                    cached = await asyncio.to_thread(_encode, geom)
+                if routes.frame_store.frame_version(timestamp) != version:
+                    continue
+                if shared_key is not None:
+                    await _shared_io(shared_store.publish, shared_key, cached.data)
         if routes.frame_store.frame_version(timestamp) != version:
             continue
         routes.tile_cache.put(encoded_key, cached)

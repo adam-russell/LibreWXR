@@ -65,7 +65,20 @@ existing disk budget. Keys include frame content version, numeric format version
 compression level, dimensions, coordinates and smooth/snow flags. A second worker
 can serve the encoded response without sampling or encoding. Encoded memory hits
 do not require the geometry to remain resident for versioned past frames. No
-additional memory cache or larger cache budget is introduced.
+larger geometry cache or cache budget is introduced. Empty responses use only
+two per-worker constants, one for each supported tile size.
+
+Certified empty tiles use the renderer's existing conservative precipitation
+mask and coverage decisions, including the model-only ocean path. On a local
+cache miss, the route validates the frame and checks for emptiness before
+shared-volume lookup or compute dispatch. Empty v1 bytes and their ETag are
+memoized per tile size, so certified blanks avoid compute/encoding queues,
+repeated compression/hashing and shared-disk reads/writes. Unknown masks fall
+through to normal rendering. Emptiness found only after sampling reuses the
+same constants and skips encoding/publication, while still paying the lookup
+and sampling costs. Existing frame invalidation and conditional/cache-age
+headers remain in effect; changing precipitation is never inferred from the
+constant's presence. The wire format and native decoder are unchanged.
 
 Disk reads, hashing and publication run off the event loop; first-request
 publication is awaited. The existing best-effort shared-store behavior falls

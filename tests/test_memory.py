@@ -4,6 +4,8 @@
 import random
 from types import SimpleNamespace
 
+import pytest
+
 from librewxr.memory import (
     CgroupUsage,
     MemoryMonitor,
@@ -33,7 +35,10 @@ class _FakeTileCache:
         self.clear_calls += 1
 
 
-def _make_monitor(monkeypatch, limit_mb: int = 1000, check_interval: int = 30):
+def _make_monitor(
+    monkeypatch, limit_mb: int = 1000, check_interval: int = 30,
+    eviction_cooldown_seconds: float = 60.0,
+):
     """Build a MemoryMonitor with a fake tile cache and coord-clear recorder."""
     tile_cache = _FakeTileCache()
     coord_calls: list[int] = []
@@ -42,8 +47,19 @@ def _make_monitor(monkeypatch, limit_mb: int = 1000, check_interval: int = 30):
         lambda: coord_calls.append(1),
         limit_mb,
         check_interval,
+        eviction_cooldown_seconds=eviction_cooldown_seconds,
     )
     return monitor, tile_cache, coord_calls
+
+
+def _fake_clock(monkeypatch):
+    """Control only the monitor's clock without changing asyncio's clock."""
+    clock = {"now": 0.0}
+    monkeypatch.setattr(
+        "librewxr.memory.time",
+        SimpleNamespace(monotonic=lambda: clock["now"]),
+    )
+    return clock
 
 
 def _fake_cgroup_usage(monkeypatch, limit_mb: int = 1000, fraction: float = 0.0):
@@ -456,13 +472,6 @@ class TestHysteresis:
         assert tile_cache.evict_calls == 0
         assert tile_cache.clear_calls == 0
 
-    def test_eviction_acts_every_check_once_past_hysteresis(self, monkeypatch):
-        monitor, tile_cache, _ = _make_monitor(monkeypatch)
-        _fake_cgroup_usage(monkeypatch, fraction=0.925)
-        for _ in range(4):
-            monitor._check()
-        assert tile_cache.evict_calls == 3  # checks 2, 3, 4 all act
-
     def test_cgroup_total_mb_reported_from_check(self, monkeypatch):
         monitor, _, _ = _make_monitor(monkeypatch)
         assert monitor.cgroup_total_mb is None
@@ -470,6 +479,92 @@ class TestHysteresis:
         monitor._check()
         # decision == 500 MB, raw cgroup total == decision + 17 MB
         assert monitor.cgroup_total_mb == 517
+
+
+class TestEvictionCooldown:
+    @pytest.mark.parametrize("fraction", [0.925, 0.98])
+    def test_repeated_actions_wait_for_cooldown(self, monkeypatch, fraction):
+        clock = _fake_clock(monkeypatch)
+        monitor, tile_cache, coord_calls = _make_monitor(monkeypatch)
+        _fake_cgroup_usage(monkeypatch, fraction=fraction)
+        releases = []
+        monkeypatch.setattr("librewxr.memory.release_memory", lambda: releases.append(1))
+        monitor._check()
+        monitor._check()
+        for now in [5.0, 30.0, 59.9]:
+            clock["now"] = now
+            monitor._check()
+        assert tile_cache.evict_calls + tile_cache.clear_calls == 1
+        assert len(releases) == 1
+        clock["now"] = 60.0
+        monitor._check()
+        assert tile_cache.evict_calls + tile_cache.clear_calls == 2
+        assert len(releases) == 2
+        assert coord_calls == ([1, 1] if fraction == 0.98 else [])
+
+    def test_critical_escalation_bypasses_partial_eviction_cooldown(self, monkeypatch):
+        clock = _fake_clock(monkeypatch)
+        monitor, tile_cache, coord_calls = _make_monitor(monkeypatch, check_interval=5)
+        state = _fake_cgroup_usage(monkeypatch, fraction=0.925)
+        monitor._check()
+        monitor._check()
+        assert tile_cache.evict_calls == 1
+        state["fraction"] = 0.98
+        clock["now"] = 5.0
+        monitor._check()
+        assert tile_cache.clear_calls == 0  # Still requires two critical checks.
+        clock["now"] = 10.0
+        monitor._check()
+        assert tile_cache.clear_calls == 1
+        assert coord_calls == [1]
+        # A full clear starts its own cooldown; pressure-band changes must
+        # not allow repeated partial evictions or full clears to bypass it.
+        state["fraction"] = 0.925
+        clock["now"] = 20.0
+        monitor._check()
+        monitor._check()
+        assert tile_cache.evict_calls == 1
+        state["fraction"] = 0.98
+        clock["now"] = 25.0
+        monitor._check()
+        monitor._check()
+        assert tile_cache.clear_calls == 1
+        clock["now"] = 69.9
+        monitor._check()
+        assert tile_cache.clear_calls == 1
+        clock["now"] = 70.0
+        monitor._check()
+        assert tile_cache.clear_calls == 2
+        assert coord_calls == [1, 1]
+
+    @pytest.mark.parametrize("recovery_fraction", [0.70, 0.87])
+    @pytest.mark.parametrize("pressure_fraction", [0.925, 0.98])
+    def test_recovery_resets_cooldown_but_preserves_hysteresis(
+        self, monkeypatch, recovery_fraction, pressure_fraction,
+    ):
+        _fake_clock(monkeypatch)
+        monitor, tile_cache, _ = _make_monitor(monkeypatch)
+        state = _fake_cgroup_usage(monkeypatch, fraction=pressure_fraction)
+        monitor._check()
+        monitor._check()
+        state["fraction"] = recovery_fraction
+        monitor._check()
+        state["fraction"] = pressure_fraction
+        monitor._check()
+        assert tile_cache.evict_calls + tile_cache.clear_calls == 1
+        monitor._check()
+        assert tile_cache.evict_calls + tile_cache.clear_calls == 2
+
+    @pytest.mark.parametrize("cooldown", [0.0, -1.0])
+    def test_nonpositive_cooldown_disables_throttling(self, monkeypatch, cooldown):
+        _fake_clock(monkeypatch)
+        monitor, tile_cache, _ = _make_monitor(
+            monkeypatch, eviction_cooldown_seconds=cooldown,
+        )
+        _fake_cgroup_usage(monkeypatch, fraction=0.925)
+        for _ in range(4):
+            monitor._check()
+        assert tile_cache.evict_calls == 3
 
 
 class TestPressureLogLatching:
@@ -489,6 +584,7 @@ class TestPressureLogLatching:
         ]
 
     def test_first_eviction_warns_once_then_repeats_at_info(self, monkeypatch, caplog):
+        clock = _fake_clock(monkeypatch)
         monitor, tile_cache, _ = _make_monitor(monkeypatch)
         _fake_cgroup_usage(monkeypatch, fraction=0.925)
         with caplog.at_level("INFO", logger="librewxr.memory"):
@@ -496,13 +592,15 @@ class TestPressureLogLatching:
             monitor._check()                  # streak 2: first action firing
             assert tile_cache.evict_calls == 1
             assert monitor._logged_evict_episode is True
-            monitor._check()                  # streak 3: repeat
-            monitor._check()                  # streak 4: repeat
+            monitor._check()                  # Suppressed during cooldown.
+            clock["now"] = 60.0
+            monitor._check()                  # Admitted repeat logs at INFO.
         assert len(self._records(caplog, "WARNING", "Memory pressure:")) == 1
         assert len(self._records(caplog, "INFO", "Memory pressure:")) >= 1
-        assert tile_cache.evict_calls == 3
+        assert tile_cache.evict_calls == 2
 
     def test_first_clear_warns_once_then_repeats_at_info(self, monkeypatch, caplog):
+        clock = _fake_clock(monkeypatch)
         monitor, tile_cache, _ = _make_monitor(monkeypatch)
         _fake_cgroup_usage(monkeypatch, fraction=0.98)
         with caplog.at_level("INFO", logger="librewxr.memory"):
@@ -510,11 +608,12 @@ class TestPressureLogLatching:
             monitor._check()                  # streak 2: first action firing
             assert tile_cache.clear_calls == 1
             assert monitor._logged_clear_episode is True
-            monitor._check()                  # streak 3: repeat
-            monitor._check()                  # streak 4: repeat
+            monitor._check()                  # Suppressed during cooldown.
+            clock["now"] = 60.0
+            monitor._check()                  # Admitted repeat logs at INFO.
         assert len(self._records(caplog, "WARNING", "Memory critical:")) == 1
         assert len(self._records(caplog, "INFO", "Memory critical:")) >= 1
-        assert tile_cache.clear_calls == 3
+        assert tile_cache.clear_calls == 2
 
     def test_latch_rearms_after_recovery(self, monkeypatch, caplog):
         monitor, tile_cache, _ = _make_monitor(monkeypatch)

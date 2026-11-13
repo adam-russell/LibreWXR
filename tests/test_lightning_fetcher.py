@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 import h5py
 import numpy as np
 import pytest
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 from librewxr.data.lightning_fetcher import (
     GOESGLMSource,
@@ -323,6 +323,11 @@ def _day_prefix(ts: int) -> str:
     return f"GLM-L2-LCFA/{dt:%Y}/{dt:%j}/"
 
 
+def _s3_key(start: int) -> str:
+    hour = datetime.fromtimestamp(start, tz=timezone.utc).strftime("%H/")
+    return _day_prefix(start) + hour + _key(19, start, start + 20)
+
+
 async def test_midnight_cold_start_lists_previous_day(tmp_path, monkeypatch):
     """A cycle just after midnight UTC must still list yesterday's dir."""
     fetcher = _make_fetcher(tmp_path, max_age_s=7200)
@@ -419,45 +424,130 @@ async def test_warm_resume_across_midnight_lists_both_days(tmp_path, monkeypatch
     assert wm["goes19"]["last_key"] == k_today
 
 
-async def test_empty_past_day_degrades_cycle(tmp_path, monkeypatch, caplog):
-    """An empty past day-directory means a degraded listing, not a gap."""
+@pytest.mark.parametrize("now", [
+    NIGHT_NOW,
+    int(datetime(2027, 1, 1, 0, 30, tzinfo=timezone.utc).timestamp()),
+])
+@pytest.mark.parametrize("watermark_age", [None, 31 * 60, 20 * 60],
+                         ids=["cold", "previous-day-watermark", "current-day-watermark"])
+async def test_exhausted_previous_day_still_ingests_today(
+    tmp_path, monkeypatch, now, watermark_age,
+):
+    """Use real S3 prefix/StartAfter filtering, including the year boundary."""
+    fetcher = _make_fetcher(tmp_path, max_age_s=7200)
+    source = fetcher._sources[0]
+    monkeypatch.setattr(fetcher, "_now_s", lambda: now)
+
+    fresh_start = now - 60
+    fresh_key = _s3_key(fresh_start)
+    objects = [fresh_key]
+    resume_key = None
+    if watermark_age is not None:
+        resume_start = now - watermark_age
+        resume_key = _s3_key(resume_start)
+        objects.append(resume_key)
+        fetcher._watermarks.update(
+            "goes19", bucket=SAT[1], last_key=resume_key,
+            last_e=resume_start + 20,
+        )
+    listed = []
+
+    def listing(url):
+        query = parse_qs(urlsplit(url).query)
+        prefix = query["prefix"][0]
+        start_after = query.get("start-after", [""])[0]
+        listed.append((prefix, start_after))
+        keys = sorted(key for key in objects
+                      if key.startswith(prefix) and key > start_after)
+        return (
+            "<ListBucketResult><IsTruncated>false</IsTruncated>"
+            + "".join(f"<Contents><Key>{key}</Key></Contents>" for key in keys)
+            + "</ListBucketResult>"
+        ).encode()
+
+    monkeypatch.setattr(source, "_get_listing_page", listing)
+    downloaded = []
+
+    def download(bucket, key):
+        downloaded.append(key)
+        return _write_glm_nc([(3.0, -80.0, 5e-14, 1.0, 0)], fresh_start)
+
+    monkeypatch.setattr(source, "_download", download)
+    await fetcher._fetch_once()
+
+    assert [prefix for prefix, _ in listed] == [
+        _day_prefix(now - 31 * 60), _day_prefix(now),
+    ]
+    assert all(after == (resume_key or "") for _, after in listed)
+    assert downloaded == [fresh_key]
+    assert fetcher._store.total_count == 1
+    assert fetcher._store.meta["satellites"]["goes19"]["last_fetch_ok"] is True
+    watermark = fetcher._watermarks.get("goes19")
+    assert watermark["last_key"] == fresh_key
+    assert watermark["last_e"] == fresh_start + 20
+
+
+@pytest.mark.parametrize("failed_day", ["previous", "current"])
+async def test_failed_day_preserves_watermark_then_retries(
+    tmp_path, monkeypatch, caplog, failed_day,
+):
+    """A failed listing cannot skip older keys or block their later retry."""
     fetcher = _make_fetcher(tmp_path, max_age_s=7200)
     source = fetcher._sources[0]
     monkeypatch.setattr(fetcher, "_now_s", lambda: NIGHT_NOW)
-
-    w_prev = NIGHT_NOW - 90 * 60
-    w_today = NIGHT_NOW - 20 * 60
-    k_prev = _key(19, w_prev, w_prev + 20)
-    k_today = _key(19, w_today, w_today + 20)
-    prev_end = _key_window_epochs(k_prev)[1]
+    previous_start = NIGHT_NOW - 90 * 60
+    old_key = _s3_key(previous_start)
+    unread_start = previous_start + 60
+    unread_key = _s3_key(unread_start)
+    today_start = NIGHT_NOW - 20 * 60
+    today_key = _s3_key(today_start)
     fetcher._watermarks.update(
-        "goes19", bucket=SAT[1], last_key=k_prev, last_e=prev_end,
+        "goes19", bucket=SAT[1], last_key=old_key, last_e=previous_start + 20,
     )
+    starts = {unread_key: unread_start, today_key: today_start}
+    failed_prefix = _day_prefix(previous_start if failed_day == "previous" else NIGHT_NOW)
+    fail = True
 
-    by_prefix = {
-        _day_prefix(w_prev): [],           # degraded: a past day is never empty
-        _day_prefix(w_today): [k_today],
-    }
+    def listing(url):
+        query = parse_qs(urlsplit(url).query)
+        prefix = query["prefix"][0]
+        if fail and prefix == failed_prefix:
+            return None
+        after = query.get("start-after", [""])[0]
+        keys = sorted(key for key in [old_key, unread_key, today_key]
+                      if key.startswith(prefix) and key > after)
+        return (
+            "<ListBucketResult><IsTruncated>false</IsTruncated>"
+            + "".join(f"<Contents><Key>{key}</Key></Contents>" for key in keys)
+            + "</ListBucketResult>"
+        ).encode()
 
-    def fake_list(bucket, prefix, start_after):
-        return list(by_prefix.get(prefix, []))
-
-    monkeypatch.setattr(source, "_list_keys", fake_list)
+    monkeypatch.setattr(source, "_get_listing_page", listing)
     downloaded = []
-    monkeypatch.setattr(
-        source, "_download",
-        lambda b, k: downloaded.append(k) or b"",
-    )
 
+    def download(bucket, key):
+        downloaded.append(key)
+        return _write_glm_nc([(4.0, -80.0, 5e-14, 1.0, 0)], starts[key])
+
+    monkeypatch.setattr(source, "_download", download)
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
         await fetcher._fetch_once()
-
     assert downloaded == []
     assert fetcher._store.total_count == 0
+    assert fetcher._store.meta["satellites"]["goes19"]["last_fetch_ok"] is False
     assert any("degraded" in r.getMessage() for r in caplog.records)
-    wm = json.loads((tmp_path / "lightning" / "watermark.json").read_text())
-    assert wm["goes19"]["last_key"] == k_prev
-    assert wm["goes19"]["last_e"] == prev_end
+    watermark = fetcher._watermarks.get("goes19")
+    assert watermark["last_key"] == old_key
+    assert watermark["last_e"] == previous_start + 20
+
+    fail = False
+    await fetcher._fetch_once()
+    assert downloaded == [unread_key, today_key]
+    assert fetcher._store.total_count == 2
+    assert fetcher._store.meta["satellites"]["goes19"]["last_fetch_ok"] is True
+    watermark = fetcher._watermarks.get("goes19")
+    assert watermark["last_key"] == today_key
+    assert watermark["last_e"] == today_start + 20
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +587,36 @@ def test_list_keys_pagination(tmp_path, monkeypatch):
     assert keys == [k1, k2, k3]
     assert len(urls) == 2
     assert "start-after=" + quote(k2) in urls[1]
+
+
+def test_list_keys_successful_empty_result(tmp_path, monkeypatch):
+    source = _make_fetcher(tmp_path)._sources[0]
+    monkeypatch.setattr(
+        source, "_get_listing_page",
+        lambda url: b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+    )
+    assert source._list_keys(SAT[1], _day_prefix(NOW), None) == []
+
+
+@pytest.mark.parametrize("failure", ["request", "malformed", "page-cap", "empty-truncated"])
+def test_incomplete_listing_never_returns_partial_keys(tmp_path, monkeypatch, failure):
+    from librewxr.data import lightning_fetcher as module
+
+    source = _make_fetcher(tmp_path)._sources[0]
+    key = _key(19, NOW - 60, NOW - 40)
+    first = (
+        f"<ListBucketResult><Contents><Key>{key}</Key></Contents>"
+        "<IsTruncated>true</IsTruncated></ListBucketResult>"
+    ).encode()
+    if failure == "page-cap":
+        monkeypatch.setattr(module, "_MAX_LIST_PAGES", 1)
+        pages = iter([first])
+    elif failure == "empty-truncated":
+        pages = iter([first, b"<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>"])
+    else:
+        pages = iter([first, None if failure == "request" else b"<error>not a listing</error>"])
+    monkeypatch.setattr(source, "_get_listing_page", lambda url: next(pages))
+    assert source._list_keys(SAT[1], _day_prefix(NOW), None) is None
 
 
 # ---------------------------------------------------------------------------

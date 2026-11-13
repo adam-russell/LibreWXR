@@ -337,19 +337,17 @@ class GOESGLMSource:
             while day <= today:
                 prefix = f"{_GLM_PREFIX_TMPL}/{day:%Y}/{day:%j}/"
                 day_keys = self._list_keys(bucket, prefix, start_after)
-                if not day_keys and day < today:
-                    # A past day-directory is never empty -- S3 always has
-                    # that day's objects.  Today's may legitimately be empty
-                    # right after midnight, so only older days degrade.
-                    # Same posture as a failed listing: no keys this cycle,
-                    # watermark untouched, retried next cycle.
+                if day_keys is None:
+                    # Abort before downloading or advancing the watermark if
+                    # any day's listing failed. A successful empty page is
+                    # normal once StartAfter has exhausted an older day.
                     logger.warning(
-                        "GLM %s: empty listing for past day-directory "
-                        "%s; treating the cycle as degraded",
+                        "GLM %s: listing failed for day-directory %s; "
+                        "treating the cycle as degraded",
                         name, f"{day:%Y}/{day:%j}",
                     )
-                    keys = []
-                    break
+                    status.update(last_key=last_key, last_e=last_e)
+                    return np.empty(0, dtype=_POINT_DTYPE), status
                 keys.extend(day_keys)
                 day += timedelta(days=1)
 
@@ -458,12 +456,12 @@ class GOESGLMSource:
 
     def _list_keys(
         self, bucket: str, prefix: str, start_after: str | None,
-    ) -> list[str]:
+    ) -> list[str] | None:
         """List every key under ``prefix`` after ``start_after`` (ascending).
 
         Paginates with ``start-after=<last-key-of-page>`` until S3 reports
-        ``IsTruncated=false``.  Returns ``[]`` on any listing failure -- a
-        failed listing is a degraded cycle, never an exception.
+        ``IsTruncated=false``. A successful empty listing returns ``[]``;
+        failures return ``None`` so callers never advance past a missing day.
         """
         base = f"https://{bucket}.s3.amazonaws.com"
         keys: list[str] = []
@@ -474,21 +472,25 @@ class GOESGLMSource:
                 url += f"&start-after={quote(start)}"
             xml = self._get_listing_page(url)
             if xml is None:
-                return []
+                return None
             try:
                 page_keys, truncated = self._parse_listing_page(xml)
             except Exception:
                 logger.warning("GLM: failed to parse listing (%s)", url, exc_info=True)
-                return []
+                return None
             keys.extend(page_keys)
-            if not truncated or not page_keys:
+            if not truncated:
                 break
+            if not page_keys:
+                logger.warning("GLM: truncated listing has no keys (%s)", url)
+                return None
             start = page_keys[-1]
         else:
             logger.warning(
                 "GLM: listing page cap (%d) hit for prefix %s",
                 _MAX_LIST_PAGES, prefix,
             )
+            return None
         return keys
 
     @staticmethod
@@ -501,8 +503,9 @@ class GOESGLMSource:
         )
         keys = _KEY_TAG_RE.findall(text)
         m = _TRUNCATED_RE.search(text)
-        truncated = m is not None and m.group(1) == "true"
-        return keys, truncated
+        if m is None:
+            raise ValueError("GLM listing has no truncation marker")
+        return keys, m.group(1) == "true"
 
     def _download(self, bucket: str, key: str) -> bytes | None:
         """Download one GLM object; ``None`` when not (yet) available."""

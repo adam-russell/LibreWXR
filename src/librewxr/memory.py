@@ -10,13 +10,16 @@ the same snapshot files, so those pages are shared, clean, and
 kernel-reclaimable — they are not actionable pressure.  Each worker also
 jitters its thresholds by a small fixed offset and requires two
 consecutive over-threshold checks before evicting, so one cgroup spike
-does not trip all workers in the same instant.
+does not trip all workers in the same instant.  Repeated eviction work is
+limited by a cooldown, while escalation from partial eviction to a full
+clear can bypass it once the critical two-check requirement is met.
 """
 import asyncio
 import ctypes
 import gc
 import logging
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +50,7 @@ def release_memory() -> None:
 _WARN_THRESHOLD = 0.85
 _EVICT_TILES_THRESHOLD = 0.90
 _EVICT_ALL_THRESHOLD = 0.95
+_EVICTION_COOLDOWN_SECONDS = 60.0
 
 
 def detect_memory_limit_mb(override_mb: int = 0) -> int:
@@ -313,12 +317,18 @@ class MemoryMonitor:
         coord_cache_clear_fn,
         memory_limit_mb: int,
         check_interval: int = 30,
+        eviction_cooldown_seconds: float = _EVICTION_COOLDOWN_SECONDS,
     ):
         self._tile_cache = tile_cache
         self._clear_coord_caches = coord_cache_clear_fn
         self._limit_bytes = memory_limit_mb * 1024 * 1024
         self._limit_mb = memory_limit_mb
         self._check_interval = check_interval
+        self._eviction_cooldown_seconds = max(0.0, eviction_cooldown_seconds)
+        self._next_eviction_at = 0.0
+        # One shared cooldown throttles both action tiers.  Only escalation
+        # from a partial eviction may bypass it, never another full clear.
+        self._last_eviction_was_full_clear = False
         self._task: asyncio.Task | None = None
         self._process = psutil.Process()
         # Per-process threshold jitter: each worker in a shared cgroup
@@ -473,11 +483,14 @@ class MemoryMonitor:
         total_mb = total_bytes // (1024 * 1024)
         self._cgroup_total_mb = total_mb if usage_info is not None else None
         label = usage_info.label if usage_info is not None else "rss"
+        eviction_ready = time.monotonic() >= self._next_eviction_at
 
         if usage >= self._evict_all_threshold:
             self._clear_streak += 1
             self._evict_streak = 0
-            if self._clear_streak >= 2:
+            if self._clear_streak >= 2 and (
+                eviction_ready or not self._last_eviction_was_full_clear
+            ):
                 # Only the first action firing of a pressure episode goes
                 # to WARNING (so the rotating log file gets exactly one
                 # line per episode instead of spam that drowns real
@@ -492,13 +505,17 @@ class MemoryMonitor:
                 self._tile_cache.clear()
                 self._clear_coord_caches()
                 release_memory()
+                self._last_eviction_was_full_clear = True
+                self._next_eviction_at = time.monotonic() + self._eviction_cooldown_seconds
 
         elif usage >= self._evict_tiles_threshold:
             self._evict_streak += 1
             self._clear_streak = 0
-            if self._evict_streak >= 2:
+            if self._evict_streak >= 2 and eviction_ready:
                 freed = self._tile_cache.evict_half()
                 release_memory()
+                self._last_eviction_was_full_clear = False
+                self._next_eviction_at = time.monotonic() + self._eviction_cooldown_seconds
                 # Same once-per-episode WARNING latch as the clear tier
                 # above; logged after the eviction so ``freed`` can be
                 # reported.
@@ -514,6 +531,10 @@ class MemoryMonitor:
         elif usage >= self._warn_threshold:
             self._evict_streak = 0
             self._clear_streak = 0
+            # Recovery below the eviction band permits a fresh response,
+            # but the warning-log episode remains latched until full recovery.
+            self._next_eviction_at = 0.0
+            self._last_eviction_was_full_clear = False
             logger.info(
                 "Memory usage elevated: %d MB (%s) / %d MB (%.0f%%; cgroup total %d MB)",
                 decision_mb, label, self._limit_mb, usage * 100, total_mb,
@@ -529,3 +550,5 @@ class MemoryMonitor:
             self._clear_streak = 0
             self._logged_evict_episode = False
             self._logged_clear_episode = False
+            self._next_eviction_at = 0.0
+            self._last_eviction_was_full_clear = False

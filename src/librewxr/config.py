@@ -267,13 +267,12 @@ class Settings(BaseSettings):
     # clock is treated as legitimately old data, not relabelled forward.
     mmd_publish_lag_sec: int = 600
     # PAGASA (Philippine Atmospheric, Geophysical and Astronomical
-    # Services Administration) PANAHON radar mosaic via anonymous
-    # CloudFront-fronted JSON+PNG API.  15-min native cadence (the
-    # store grid is 10 min, so the source rounds each requested slot
-    # to the nearest native frame, ≤7.5 min off — invisible in
-    # animation).  Public domain license per Philippine IP code
+    # Services Administration) PANaHON radar mosaic via the anonymous
+    # origin JSON/numeric-PNG API. Native timestamps are currently 10 min
+    # apart; Web Mercator images are reprojected to the PHCOMP grid.
+    # Public domain license per Philippine IP code
     # RA 8293 §176; attribution to PAGASA in README.
-    pagasa_base_url: str = "https://cdn.panahon.gov.ph"
+    pagasa_base_url: str = "https://panahon.gov.ph"
     pagasa_enabled: bool = True
     # DPC Italy national radar composite via the open Radar-DPC v2 REST API
     # (``radar-api.protezionecivile.it``).  Anonymous, 5-min native cadence,

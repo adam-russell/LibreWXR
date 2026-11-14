@@ -114,7 +114,7 @@ License: **JMA Public Data License v1.0** — CC-BY equivalent, explicit commerc
 
 ### Philippines — PAGASA PANAHON (PHCOMP)
 
-Reinstated 2026-08-19 (see "Reverted and removed" for history). CDN PNG mosaic, 6-frame 15-min timeline, 9 stations, 2048x2048 grid, SOUTHEAST_ASIA group.
+Reinstated 2026-08-19 (see "Reverted and removed" for history). Updated for the current PANaHON origin API: timestamp-based numeric Web Mercator PNGs, currently nine frames at 10-minute cadence, decoded using the advertised dBZ scale and reprojected onto the existing 2048×2048 geographic grid. Nine stations, SOUTHEAST_ASIA group. Missing 1×1 image placeholders are rejected.
 
 ## Radar — Reverted and removed
 

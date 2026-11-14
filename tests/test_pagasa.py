@@ -1,410 +1,411 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Joshua Kimsey
-"""Tests for the PAGASA Philippines radar source (sources/regional/
-southeast_asia/philippines/radar/pagasa/)."""
+"""PAGASA's current numeric API, projection, missing data and cache contract."""
 import asyncio
 import io
-import json
+import math
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import numpy as np
-import pytest
 from PIL import Image
+import pytest
+
+from librewxr.data.regions import REGIONS, RegionDef, resolve_regions
+from librewxr.config import Settings
+from librewxr.sources.regional.southeast_asia.philippines.radar import pagasa
+from librewxr.sources.regional.southeast_asia.philippines.radar.pagasa import source as mod
+from librewxr.sources.regional.southeast_asia.philippines.radar.pagasa.source import (
+    PAGASASource, _ImageSpec, _decode_numeric_png, _image_spec,
+)
 
 pytestmark = pytest.mark.sources
-
-from librewxr.sources.regional.southeast_asia.philippines.radar.pagasa.source import (
-    PAGASASource,
-    _MAX_NEAREST_OFFSET_SEC,
-    _PAGASA_CLUTTER_STOPS,
-    _PAGASA_EXPECTED_FRAMES,
-    _PAGASA_EXPECTED_HEIGHT,
-    _PAGASA_EXPECTED_WIDTH,
-    _PAGASA_NATIVE_CADENCE_SEC,
-    _PAGASA_PALETTE,
-    _build_palette_arrays,
-    _decode_pagasa_png,
-)
-from librewxr.data.regions import REGIONS, resolve_regions
+BOUNDS = [115.41549141305251, 3.801613036809332, 129.51730887177652, 22.45850950564088]
+START = 1794670800
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Region definition
-# ─────────────────────────────────────────────────────────────────────
-class TestPhilippinesRegion:
-    def test_phcomp_in_regions(self):
-        assert "PHCOMP" in REGIONS
-
-    def test_phcomp_bounds_match_panahon_js_bundle(self):
-        # Bounds come from the PANAHON web app's JS bundle
-        # (``leftBottom``/``rightTop`` for the composite view).  Off-by-
-        # much here would mis-register Philippine coastlines.
-        r = REGIONS["PHCOMP"]
-        assert r.west == pytest.approx(115.4155, abs=0.001)
-        assert r.east == pytest.approx(129.5173, abs=0.001)
-        assert r.south == pytest.approx(3.8017, abs=0.001)
-        assert r.north == pytest.approx(22.4585, abs=0.001)
-        assert r.group == "SOUTHEAST_ASIA"
-
-    def test_phcomp_native_grid_is_2048_square(self):
-        # The PNG endpoint serves a 2048×2048 RGBA at the composite
-        # bounds.  Region size must match exactly so tiles register
-        # against PAGASA's pixel grid 1:1.
-        r = REGIONS["PHCOMP"]
-        assert r.width == 2048
-        assert r.height == 2048
-
-    def test_phcomp_pixel_size_is_anisotropic(self):
-        # The 2048×2048 PNG covers a wider lat span (18.66°) than
-        # lon span (14.10°), so pixels are non-square in geographic
-        # units — pixel_size_y must be set explicitly.
-        r = REGIONS["PHCOMP"]
-        assert r._ps_y > r.pixel_size
-        assert r.pixel_size == pytest.approx(0.006886, abs=1e-5)
-        assert r._ps_y == pytest.approx(0.009110, abs=1e-5)
-
-    def test_southeast_asia_includes_phcomp(self):
-        names = resolve_regions("SOUTHEAST_ASIA")
-        assert "PHCOMP" in names
-
-    def test_all_includes_phcomp(self):
-        names = resolve_regions("ALL")
-        assert "PHCOMP" in names
+def metadata(count=9, start=START):
+    return {
+        "success": True,
+        "data": {
+            "timeline": [{"observed_at_unix": start + i * 600, "image_url": ""} for i in range(count)],
+            "bounds": list(BOUNDS), "scale": {"mode": "dbz", "max": 80, "sqrt": False},
+            "image_sizes": [896, 1024, 1536, 2048], "tile_version": 5,
+            "no_data": False,
+        },
+    }
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Station inventory
-# ─────────────────────────────────────────────────────────────────────
-class TestStationInventory:
-    def test_nine_stations_including_davao(self):
-        # The app's current station list has NINE radars (Davao added
-        # since May 2026): Baguio, Baler, Echague, Daet, Guiuan, Iloilo,
-        # Davao, Kabacan, Panabo.
-        from librewxr.sources.regional.southeast_asia.philippines.radar.pagasa.stations import (
-            PHCOMP_STATIONS,
-        )
-        assert len(PHCOMP_STATIONS) == 9
-
-    def test_davao_station_present(self):
-        from librewxr.sources.regional.southeast_asia.philippines.radar.pagasa.stations import (
-            PHCOMP_STATIONS,
-        )
-        names_and_coords = PHCOMP_STATIONS
-        # Davao is the last Mindanao-side entry; check a coordinate
-        # close to the PAGASA Davao radar site (~7.13, 125.65).
-        davao = names_and_coords[6]
-        assert davao[0] == pytest.approx(7.13, abs=0.05)
-        assert davao[1] == pytest.approx(125.65, abs=0.05)
+def png(array):
+    stream = io.BytesIO()
+    Image.fromarray(array).save(stream, format="PNG")
+    return stream.getvalue()
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Palette decode
-# ─────────────────────────────────────────────────────────────────────
-class TestPaletteDecode:
-    def test_palette_is_thirteen_stops(self):
-        # The PANAHON JS bundle's
-        # ``generateGradientColormap([...], 13, [0, 75])`` produces a
-        # 13-stop linear ramp.  Adding/removing stops here will desync
-        # the decoder from the upstream colour mapping.
-        assert len(_PAGASA_PALETTE) == 13
+def image(spec, value=128, alpha=255):
+    width, height = spec.dimensions
+    pixels = np.zeros((height, width, 4), dtype=np.uint8)
+    pixels[..., 0] = value
+    pixels[..., 3] = alpha
+    return png(pixels)
 
-    def test_palette_dbz_is_linear_zero_to_seventyfive(self):
-        # 0–75 dBZ in 13 stops = 6.25 dBZ per stop.  This is the
-        # spec encoded in the JS bundle; verify our table matches.
-        for i, (_, _, _, dbz) in enumerate(_PAGASA_PALETTE):
-            assert dbz == pytest.approx(i * 75.0 / 12.0, abs=1e-6)
 
-    def test_clutter_stops_are_grays(self):
-        # The first three stops are the weak-echo greys (#9c9c9c,
-        # #b4b4b4, #c8c8c8) that we treat as no-data downstream.
-        for i in range(_PAGASA_CLUTTER_STOPS):
-            r, g, b, _ = _PAGASA_PALETTE[i]
-            assert r == g == b
+def client_source(handler):
+    source = PAGASASource()
+    def public_session(request):
+        if request.url.path == "/":
+            return httpx.Response(200, text='<meta name="csrf-token" content="anonymous-test-token">',
+                                  headers={"Set-Cookie": "pagasa_test=anonymous; Path=/"})
+        return handler(request)
+    source._client = httpx.AsyncClient(transport=httpx.MockTransport(public_session))
+    return source
 
-    def test_transparent_pixels_decode_to_nodata(self):
-        rgba = np.zeros((4, 4, 4), dtype=np.uint8)
-        rgba[..., :3] = 0xff
-        rgba[..., 3] = 0
-        out = _decode_pagasa_png(rgba)
-        assert out.dtype == np.uint8
-        assert out.shape == (4, 4)
-        assert (out == 0).all()
 
-    def test_precip_pixels_decode_to_palette_dbz(self):
-        # Paint a single yellow pixel (#ffff00, dBZ=37.5) at α=255.
-        rgba = np.zeros((4, 4, 4), dtype=np.uint8)
-        rgba[1, 2] = (0xff, 0xff, 0x00, 0xff)
-        out = _decode_pagasa_png(rgba)
-        expected = int(np.clip((37.5 + 32.0) * 2.0, 0, 255))
-        assert out[1, 2] == expected
-        # Other pixels are transparent → no-data.
-        assert out.sum() == expected
+@pytest.fixture
+def small_region():
+    return RegionDef(name="TEST", group="TEST", west=1, east=4, south=30, north=60,
+                     pixel_size=3/8, pixel_size_y=30/8, grid_width=8, grid_height=8)
 
-    def test_clutter_grays_decode_to_nodata(self):
-        # All three clutter grays must decode to no-data even when
-        # painted with non-zero alpha, matching the alpha-encoded
-        # weak-echo flag from the source PNG.
-        for i in range(_PAGASA_CLUTTER_STOPS):
-            r, g, b, _ = _PAGASA_PALETTE[i]
-            rgba = np.zeros((2, 2, 4), dtype=np.uint8)
-            rgba[0, 0] = (r, g, b, 200)
-            out = _decode_pagasa_png(rgba)
-            assert out[0, 0] == 0, f"clutter stop {i} should decode to 0"
 
-    def test_each_precip_stop_decodes_distinctly(self):
-        # Every non-clutter palette stop must map to a unique uint8
-        # encoded dBZ value — collisions would silently merge bins.
-        encoded = set()
-        for i in range(_PAGASA_CLUTTER_STOPS, len(_PAGASA_PALETTE)):
-            r, g, b, dbz = _PAGASA_PALETTE[i]
-            rgba = np.zeros((1, 1, 4), dtype=np.uint8)
-            rgba[0, 0] = (r, g, b, 255)
-            out = _decode_pagasa_png(rgba)
-            encoded.add(int(out[0, 0]))
-        assert len(encoded) == len(_PAGASA_PALETTE) - _PAGASA_CLUTTER_STOPS
+class TestRegionAndSettings:
+    def test_grid_is_preserved(self):
+        region = REGIONS["PHCOMP"]
+        assert region.width == region.height == 2048
+        assert (region.west, region.east) == pytest.approx((115.4154914129329, 129.51727937415484))
+        assert (region.south, region.north) == pytest.approx((3.8016540706290445, 22.458510294136033))
+        assert region._ps_y > region.pixel_size
+        assert "PHCOMP" in resolve_regions("ALL")
+        assert "PHCOMP" in resolve_regions("SOUTHEAST_ASIA")
 
-    def test_wrong_channel_count_raises(self):
-        rgb = np.zeros((4, 4, 3), dtype=np.uint8)
+    def test_stations_and_provider(self, monkeypatch):
+        monkeypatch.delenv("LIBREWXR_PAGASA_BASE_URL", raising=False)
+        monkeypatch.delenv("LIBREWXR_PAGASA_ENABLED", raising=False)
+        settings = Settings(_env_file=None)
+        assert settings.pagasa_base_url == "https://panahon.gov.ph"
+        contribution = pagasa.radar_provider(settings)
+        assert contribution.instance._base_url == settings.pagasa_base_url
+        assert len(pagasa.PHCOMP_STATIONS) == 9
+        settings.pagasa_enabled = False
+        assert pagasa.radar_provider(settings) is None
+
+    def test_custom_origin_is_respected(self):
+        source = PAGASASource("https://mirror.example/radar/")
+        spec = _image_spec(metadata()["data"])
+        assert source._timeline_url == "https://mirror.example/radar/api/v1/radar/timeline?sublayer=mosaic-reflectivity"
+        url = urlsplit(source._image_url(START, spec))
+        assert url.path == "/radar/api/v1/radar-data-image"
+        assert parse_qs(url.query) == {
+            "sublayer": ["mosaic-reflectivity"], "t": [str(START)],
+            "mode": ["dbz"], "size": ["2048"], "v": ["5"],
+        }
+
+    def test_davao_station_is_preserved(self):
+        assert pagasa.PHCOMP_STATIONS[6] == pytest.approx((7.13, 125.65), abs=.05)
+
+
+class TestMetadata:
+    def test_uses_mercator_aspect_ratio(self):
+        spec = _image_spec(metadata()["data"])
+        width, height = spec.dimensions
+        xspan = math.radians(BOUNDS[2] - BOUNDS[0])
+        yspan = math.asinh(math.tan(math.radians(BOUNDS[3]))) - math.asinh(math.tan(math.radians(BOUNDS[1])))
+        assert height == 2048
+        assert width == math.floor(2048 * xspan / yspan + .5)
+        assert width != round(2048 * (BOUNDS[2] - BOUNDS[0]) / (BOUNDS[3] - BOUNDS[1]))
+
+    @pytest.mark.parametrize("key,value", [
+        ("bounds", None), ("bounds", [1, 2, 3]), ("bounds", [3, 2, 1, 4]),
+        ("bounds", [1, 2, float("nan"), 4]), ("bounds", [1, -90, 3, 90]),
+        ("bounds", [True, 2, 3, 4]), ("bounds", [1, 2, 3, 2]),
+        ("scale", None), ("scale", {"mode": "rain", "max": 80}),
+        ("scale", {"mode": "dbz", "max": 0}), ("scale", {"mode": "dbz", "max": float("inf")}),
+        ("scale", {"mode": "dbz", "max": True}),
+        ("scale", {"mode": "dbz", "max": 80, "sqrt": "false"}),
+        ("tile_version", 0), ("tile_version", True), ("image_sizes", []),
+    ])
+    def test_rejects_unusable_contract(self, key, value):
+        data = metadata()["data"]
+        data[key] = value
         with pytest.raises(ValueError):
-            _decode_pagasa_png(rgb)
+            _image_spec(data)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Timeline + image decode end-to-end
-# ─────────────────────────────────────────────────────────────────────
-def _make_test_png(palette_index: int) -> bytes:
-    """Build a 2048×2048 RGBA PNG filled with one palette colour."""
-    r, g, b, _ = _PAGASA_PALETTE[palette_index]
-    rgba = np.zeros(
-        (_PAGASA_EXPECTED_HEIGHT, _PAGASA_EXPECTED_WIDTH, 4), dtype=np.uint8,
-    )
-    rgba[..., 0] = r
-    rgba[..., 1] = g
-    rgba[..., 2] = b
-    rgba[..., 3] = 255
-    buf = io.BytesIO()
-    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
-    return buf.getvalue()
+class TestNumericDecode:
+    def test_value_alpha_and_scale(self):
+        spec = _ImageSpec((0, 0, 10, 10), 80, False, 5, 16)
+        width, height = spec.dimensions
+        region = RegionDef(name="TEST", group="TEST", west=0, east=10, south=0, north=10,
+                           pixel_size=10/width, pixel_size_y=10/height, grid_width=width, grid_height=height)
+        data = np.zeros((height, width, 4), dtype=np.uint8)
+        data[..., 0] = 128
+        data[..., 3] = 255
+        data[0, :4, 0] = [0, 128, 255, 255]
+        data[0, 3, 3] = 0
+        decoded = _decode_numeric_png(png(data), spec, region)
+        assert decoded.dtype == np.uint8 and decoded.shape == (height, width)
+        assert decoded[0, :4].tolist() == [64, 144, 224, 0]
+
+    def test_sqrt_scale_is_applied_before_librewxr_encoding(self, small_region):
+        spec = _ImageSpec((1, 30, 4, 60), 80, True, 5, 128)
+        decoded = _decode_numeric_png(image(spec, value=128), spec, small_region)
+        expected = int((80 * (128/255)**2 + 32) * 2)
+        assert np.all(decoded == expected)
+
+    def test_mercator_rows_are_reprojected_not_stretched(self, small_region):
+        spec = _ImageSpec((1, 30, 4, 60), 80, False, 5, 256)
+        width, height = spec.dimensions
+        values = np.zeros((height, width, 4), dtype=np.uint8)
+        values[..., 0] = np.arange(height)[:, None]
+        values[..., 3] = 255
+        decoded = _decode_numeric_png(png(values), spec, small_region)
+        resolution = math.radians(3) / width
+        # Target row 4 is latitude 45. Mercator is not linear in latitude.
+        row = math.floor((math.asinh(math.tan(math.radians(60))) - math.asinh(math.tan(math.radians(45)))) / resolution)
+        assert row != round(height/2)
+        assert decoded[4, 3] == int((row/255*80 + 32)*2)
+
+    def test_outside_source_extent_is_nodata(self):
+        region = RegionDef(name="TEST", group="TEST", west=0, east=10, south=0, north=10,
+                           pixel_size=1, grid_width=10, grid_height=10)
+        spec = _ImageSpec((2, 2, 8, 8), 80, False, 5, 64)
+        decoded = _decode_numeric_png(image(spec, 255), spec, region)
+        assert decoded[5, 5] == 224
+        assert not decoded[:, :2].any() and not decoded[:2, :].any()
+        assert not decoded[:, 8:].any() and not decoded[9:, :].any()
+
+    def test_full_sized_clear_image_is_valid(self, small_region):
+        spec = _ImageSpec((1, 30, 4, 60), 80, False, 5, 128)
+        assert not _decode_numeric_png(image(spec, alpha=0), spec, small_region).any()
+
+    @pytest.mark.parametrize("kind", ["placeholder", "wrong-size", "corrupt", "rgb"])
+    def test_bad_image_is_rejected(self, kind, small_region):
+        spec = _ImageSpec((1, 30, 4, 60), 80, False, 5, 128)
+        if kind == "placeholder":
+            body = png(np.zeros((1, 1, 4), dtype=np.uint8))
+        elif kind == "corrupt":
+            body = b"not a png"
+        elif kind == "wrong-size":
+            body = png(np.zeros((4, 4, 4), dtype=np.uint8))
+        else:
+            width, height = spec.dimensions
+            body = png(np.zeros((height, width, 3), dtype=np.uint8))
+        with pytest.raises((ValueError, OSError)):
+            _decode_numeric_png(body, spec, small_region)
 
 
-def _make_timeline(start_unix: int, count: int = 6) -> dict:
-    """Build a timeline payload mirroring the PANAHON API shape."""
-    entries = []
-    for i in range(count):
-        ts = start_unix + i * _PAGASA_NATIVE_CADENCE_SEC
-        entries.append({
-            "observed_at": "2026-05-16 00:00:00",
-            "observed_at_unix": ts,
-            "image_url": f"http://panahon.gov.ph/api/v1/radar?id={i}",
-        })
-    return {"success": True, "data": {"timeline": entries}}
-
-
-class _FakeResp:
-    def __init__(
-        self,
-        status_code: int,
-        content: bytes = b"",
-        payload: dict | None = None,
-        headers: dict | None = None,
-    ):
-        self.status_code = status_code
-        self.content = content
-        self._payload = payload
-        self.headers = headers or {}
-
-    def json(self):
-        if self._payload is None:
-            raise json.JSONDecodeError("no body", "", 0)
-        return self._payload
-
-
-def _stub_retry_get(timeline_resp, image_resps):
-    """Return a retry_get stand-in that dispatches by URL substring."""
-    async def fake(client, url, **kwargs):
-        if "/timeline" in url:
-            return timeline_resp
-        if "index=" in url:
-            idx = int(url.rsplit("index=", 1)[1].split("&", 1)[0])
-            return image_resps[idx]
-        raise AssertionError(f"unexpected URL {url}")
-    return fake
-
-
-class TestPAGASARefresh:
-    """End-to-end through the source's _refresh — verifies the
-    timeline → image-fetch → cache pipeline on synthetic responses."""
-
-    def test_refresh_populates_six_timestamps(self):
-        # The timeline endpoint returns 6 frames at 15-min cadence.
-        # After one refresh the cache must hold all six native ts.
-        start = 1778962500
-        timeline = _FakeResp(200, payload=_make_timeline(start))
-        # Paint each frame with a different palette stop so a per-frame
-        # decode mistake (frame swap, off-by-one) would show as a
-        # different dominant uint8 value per timestamp.
-        images = [
-            _FakeResp(200, content=_make_test_png(_PAGASA_CLUTTER_STOPS + i))
-            for i in range(_PAGASA_EXPECTED_FRAMES)
-        ]
-        src = PAGASASource()
-        import librewxr.sources.regional.southeast_asia.philippines.radar.pagasa.source as mod
-        original = mod.retry_get
-        mod.retry_get = _stub_retry_get(timeline, images)
+class TestRefresh:
+    async def test_anonymous_session_refreshes_expired_token(self):
+        sessions = timelines = 0
+        def handler(request):
+            nonlocal sessions, timelines
+            if request.url.path == "/":
+                sessions += 1
+                return httpx.Response(200, text=f"<meta content='token{sessions}' name='csrf-token'>",
+                                      headers={"Set-Cookie": f"session={sessions}; Path=/"})
+            timelines += 1
+            assert request.url.params["token"] == f"token{sessions}"
+            assert request.headers["cookie"] == f"session={sessions}"
+            assert request.url.params["sublayer"] == "mosaic-reflectivity"
+            return httpx.Response(419) if timelines == 1 else httpx.Response(200, json=metadata(0))
+        source = PAGASASource()
+        source._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
-            asyncio.run(src._refresh())
+            await source._refresh()
+            assert sessions == timelines == 2
+            source._last_fetch_unix = 0
+            await source._refresh()
+            assert sessions == 2 and timelines == 3
         finally:
-            mod.retry_get = original
+            await source.close()
 
-        assert len(src._cache_order) == _PAGASA_EXPECTED_FRAMES
-        # Timestamps must come back in ascending order and at the
-        # native cadence — verifies we don't deduplicate or drop any.
-        deltas = [b - a for a, b in zip(src._cache_order, src._cache_order[1:])]
-        assert all(d == _PAGASA_NATIVE_CADENCE_SEC for d in deltas)
-
-    def test_refresh_handles_empty_timeline_gracefully(self):
-        timeline = _FakeResp(200, payload={"success": True, "data": {"timeline": []}})
-        src = PAGASASource()
-        import librewxr.sources.regional.southeast_asia.philippines.radar.pagasa.source as mod
-        original = mod.retry_get
-        mod.retry_get = _stub_retry_get(timeline, [])
+    async def test_tokenless_compatible_mirror_is_supported(self):
+        def handler(request):
+            if request.url.path == "/":
+                return httpx.Response(404)
+            assert "token" not in request.url.params
+            return httpx.Response(200, json=metadata(0))
+        source = PAGASASource()
+        source._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
-            asyncio.run(src._refresh())
+            await source._refresh()
+            assert not source._cache_order
         finally:
-            mod.retry_get = original
-        assert src._cache_order == []
+            await source.close()
 
-    def test_refresh_survives_failed_image_fetch(self):
-        # If one of the per-index image fetches 404s, the rest must
-        # still populate — a single dropped frame must not poison the
-        # whole cache.
-        start = 1778962500
-        timeline = _FakeResp(200, payload=_make_timeline(start))
-        images = []
-        for i in range(_PAGASA_EXPECTED_FRAMES):
-            if i == 2:
-                images.append(_FakeResp(404))
-            else:
-                images.append(_FakeResp(
-                    200, content=_make_test_png(_PAGASA_CLUTTER_STOPS),
-                ))
-        src = PAGASASource()
-        import librewxr.sources.regional.southeast_asia.philippines.radar.pagasa.source as mod
-        original = mod.retry_get
-        mod.retry_get = _stub_retry_get(timeline, images)
+    async def test_all_nine_frames_and_timestamp_requests(self):
+        data = metadata()
+        spec = _image_spec(data["data"])
+        body = image(spec)
+        seen = []
+        def handler(request):
+            assert request.headers["referer"] == "https://panahon.gov.ph/"
+            assert request.headers["user-agent"].startswith("LibreWXR")
+            assert request.url.params["token"] == "anonymous-test-token"
+            assert request.headers["cookie"] == "pagasa_test=anonymous"
+            assert request.url.params["sublayer"] == "mosaic-reflectivity"
+            if request.url.path.endswith("/timeline"):
+                return httpx.Response(200, json=data)
+            seen.append(int(request.url.params["t"]))
+            assert request.url.path == "/api/v1/radar-data-image"
+            assert request.url.params["mode"] == "dbz" and request.url.params["v"] == "5"
+            return httpx.Response(200, content=body)
+        source = client_source(handler)
         try:
-            asyncio.run(src._refresh())
+            await source._refresh()
+            assert source._cache_order == sorted(seen) == [START + i*600 for i in range(9)]
+            assert all(grid.shape == (2048, 2048) for grid in source._frame_cache.values())
+            assert all(grid[1000, 1000] == 144 for grid in source._frame_cache.values())
+            body = image(spec, value=255)
+            source._last_fetch_unix = 0
+            await source._refresh()
+            assert len(seen) == 18
+            assert all(grid[1000, 1000] == 224 for grid in source._frame_cache.values())
         finally:
-            mod.retry_get = original
-        assert len(src._cache_order) == _PAGASA_EXPECTED_FRAMES - 1
+            await source.close()
 
-
-# ─────────────────────────────────────────────────────────────────────
-# Nearest-frame lookup (15-min native vs 10-min store grid)
-# ─────────────────────────────────────────────────────────────────────
-class TestNearestCached:
-    def test_returns_none_on_empty_cache(self):
-        src = PAGASASource()
-        assert src._nearest_cached(1778962500) is None
-
-    def test_exact_match_returns_exact_ts(self):
-        src = PAGASASource()
-        ts = 1778962500
-        src._frame_cache[ts] = np.zeros((4, 4), dtype=np.uint8)
-        src._cache_order = [ts]
-        assert src._nearest_cached(ts) == ts
-
-    def test_returns_nearest_within_threshold(self):
-        # 10-min store slot 5 min off a 15-min native frame should
-        # still hit — the threshold is half the native cadence (7.5 min).
-        src = PAGASASource()
-        native_ts = 1778962500     # 0
-        store_ts = native_ts + 300  # +5 min
-        src._frame_cache[native_ts] = np.zeros((4, 4), dtype=np.uint8)
-        src._cache_order = [native_ts]
-        assert src._nearest_cached(store_ts) == native_ts
-
-    def test_returns_none_outside_threshold(self):
-        # 8 min off must NOT match — that store slot belongs to a
-        # different native frame which is not in cache yet.
-        src = PAGASASource()
-        native_ts = 1778962500
-        store_ts = native_ts + _MAX_NEAREST_OFFSET_SEC + 1
-        src._frame_cache[native_ts] = np.zeros((4, 4), dtype=np.uint8)
-        src._cache_order = [native_ts]
-        assert src._nearest_cached(store_ts) is None
-
-    def test_returns_truly_nearest_with_multiple_candidates(self):
-        src = PAGASASource()
-        a = 1778962500
-        b = a + _PAGASA_NATIVE_CADENCE_SEC   # +15 min
-        src._frame_cache[a] = np.zeros((4, 4), dtype=np.uint8)
-        src._frame_cache[b] = np.zeros((4, 4), dtype=np.uint8)
-        src._cache_order = [a, b]
-        # Midway between two native frames → ties go to the earlier
-        # candidate via Python's min stability.  Either is acceptable.
-        midpoint = a + _PAGASA_NATIVE_CADENCE_SEC // 2
-        assert src._nearest_cached(midpoint) in (a, b)
-        assert src._nearest_cached(a + 100) == a
-        assert src._nearest_cached(b - 100) == b
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Source fetch + cache
-# ─────────────────────────────────────────────────────────────────────
-class TestPAGASASource:
-    def test_url_strips_trailing_slash_in_base(self):
-        src = PAGASASource("https://example.test/")
-        assert src._timeline_url == (
-            "https://example.test/api/v1/radar/timeline"
-        )
-
-    def test_image_url_includes_sublayer_and_index(self):
-        src = PAGASASource("https://example.test")
-        url = src._image_url(3)
-        assert "sublayer=hybrid-reflectivity" in url
-        assert "index=3" in url
-
-    def test_fetch_returns_none_when_timeline_fails(self):
-        src = PAGASASource()
-        timeline = _FakeResp(404)
-        import librewxr.sources.regional.southeast_asia.philippines.radar.pagasa.source as mod
-        original = mod.retry_get
-        mod.retry_get = _stub_retry_get(timeline, [])
+    async def test_partial_failure_does_not_poison_other_frames(self, caplog):
+        data = metadata(3)
+        spec = _image_spec(data["data"])
+        valid = image(spec)
+        placeholder = png(np.zeros((1, 1, 4), dtype=np.uint8))
+        def handler(request):
+            if request.url.path.endswith("/timeline"):
+                return httpx.Response(200, json=data)
+            timestamp = int(request.url.params["t"])
+            if timestamp == START:
+                return httpx.Response(200, content=placeholder)
+            return httpx.Response(404) if timestamp == START+600 else httpx.Response(200, content=valid)
+        source = client_source(handler)
         try:
-            result = asyncio.run(
-                src.fetch_frame(REGIONS["PHCOMP"], minutes_ago=0)
-            )
+            await source._refresh()
+            assert source._cache_order == [START+1200]
+            assert "1x1 placeholder" in caplog.text and "HTTP 404" in caplog.text
         finally:
-            mod.retry_get = original
-        assert result is None
+            await source.close()
 
-    def test_fetch_raises_on_wrong_region(self):
-        src = PAGASASource()
-        with pytest.raises(ValueError):
-            asyncio.run(
-                src.fetch_frame(REGIONS["MYPENINSULAR"], minutes_ago=0)
-            )
-
-    def test_fetch_for_archive_ts_outside_buffer_returns_none(self):
-        # The timeline endpoint only carries ~75 min of backfill, so
-        # archive lookups for last week must return None instead of
-        # silently lying with the oldest cached frame.
-        src = PAGASASource()
-        start = 1778962500
-        timeline = _FakeResp(200, payload=_make_timeline(start))
-        images = [
-            _FakeResp(200, content=_make_test_png(_PAGASA_CLUTTER_STOPS))
-            for _ in range(_PAGASA_EXPECTED_FRAMES)
-        ]
-        import librewxr.sources.regional.southeast_asia.philippines.radar.pagasa.source as mod
-        original = mod.retry_get
-        mod.retry_get = _stub_retry_get(timeline, images)
+    async def test_placeholder_retry_recovers_without_fabricating_clear_frames(self):
+        data = metadata(1)
+        valid = image(_image_spec(data["data"]), value=255)
+        placeholder = png(np.zeros((1, 1, 4), dtype=np.uint8))
+        available = False
+        def handler(request):
+            if request.url.path.endswith("/timeline"):
+                return httpx.Response(200, json=data)
+            return httpx.Response(200, content=valid if available else placeholder)
+        source = client_source(handler)
         try:
-            stale_dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
-            result = asyncio.run(
-                src.fetch_archive_frame(REGIONS["PHCOMP"], stale_dt)
-            )
+            await source._refresh()
+            assert not source._frame_cache and source._nearest_cached(START) is None
+            available = True
+            source._last_fetch_unix = 0
+            await source._refresh()
+            assert source._cache_order == [START]
+            assert source._frame_cache[START][1000, 1000] == 224
+            available = False
+            source._last_fetch_unix = 0
+            await source._refresh()
+            assert source._frame_cache[START][1000, 1000] == 224
         finally:
-            mod.retry_get = original
-        assert result is None
+            await source.close()
+
+    @pytest.mark.parametrize("payload", [[], {}, {"success": False}, {"success": True, "data": []},
+        {"success": True, "data": {"timeline": []}}, {"success": True, "data": {"timeline": [1], "no_data": True}}])
+    async def test_invalid_or_empty_timeline_does_not_fetch_images(self, payload):
+        calls = []
+        def handler(request):
+            calls.append(request.url.path)
+            return httpx.Response(200, json=payload)
+        source = client_source(handler)
+        try:
+            await source._refresh()
+            assert not source._cache_order and calls == ["/api/v1/radar/timeline"]
+        finally:
+            await source.close()
+
+    @pytest.mark.parametrize("failure", ["status", "transport", "non-json", "metadata"])
+    async def test_timeline_failure_preserves_cache_and_has_diagnostics(self, failure, caplog, monkeypatch):
+        monkeypatch.setattr(mod.retry_get.__globals__["settings"], "download_retries", 0)
+        def handler(request):
+            if failure == "transport":
+                raise httpx.ConnectError("DNS failure", request=request)
+            if failure == "status":
+                return httpx.Response(503)
+            if failure == "non-json":
+                return httpx.Response(200, content=b"generic image instead of JSON")
+            payload = metadata(); payload["data"]["scale"]["mode"] = "rain"
+            return httpx.Response(200, json=payload)
+        source = client_source(handler)
+        source._frame_cache[START] = np.ones((2, 2), dtype=np.uint8)
+        source._cache_order = [START]
+        try:
+            await source._refresh()
+            assert source._cache_order == [START] and np.all(source._frame_cache[START] == 1)
+            assert "PAGASA" in caplog.text
+        finally:
+            await source.close()
+
+    async def test_refresh_coalesces_and_limits_parallel_images(self):
+        data = metadata(5); spec = _image_spec(data["data"]); body = image(spec)
+        active = maximum = timelines = 0
+        async def handler(request):
+            nonlocal active, maximum, timelines
+            if request.url.path.endswith("/timeline"):
+                timelines += 1
+                await asyncio.sleep(.01)
+                return httpx.Response(200, json=data)
+            active += 1; maximum = max(maximum, active)
+            await asyncio.sleep(.01)
+            active -= 1
+            return httpx.Response(200, content=body)
+        source = client_source(handler)
+        try:
+            await asyncio.gather(*(source._refresh() for _ in range(6)))
+            assert timelines == 1 and maximum <= 2 and len(source._cache_order) == 5
+        finally:
+            await source.close()
+
+    async def test_malformed_timestamps_deduplicate_and_bound_downloads(self, monkeypatch):
+        data = metadata(30)
+        data["data"]["timeline"] += [{"observed_at_unix": START}, {}, None, {"observed_at_unix": True}, {"observed_at_unix": "bad"}]
+        seen = []
+        def handler(request):
+            if request.url.path.endswith("/timeline"):
+                return httpx.Response(200, json=data)
+            seen.append(int(request.url.params["t"]))
+            return httpx.Response(200, content=b"mock image")
+        monkeypatch.setattr(mod, "_decode_numeric_png", lambda *args:np.ones((2, 2), dtype=np.uint8))
+        source = client_source(handler)
+        try:
+            await source._refresh()
+            assert sorted(seen) == [START+i*600 for i in range(6, 30)]
+            assert len(source._cache_order) == 24
+        finally:
+            await source.close()
+
+
+class TestLookup:
+    def test_nearest_frame_does_not_extend_staleness(self):
+        source = PAGASASource()
+        assert source._nearest_cached(START) is None
+        source._cache_order = [START, START+600]
+        assert source._nearest_cached(START) == START
+        assert source._nearest_cached(START+300) == START
+        assert source._nearest_cached(START+901) is None
+
+    async def test_real_timestamps_and_timezone_are_preserved(self, monkeypatch):
+        source = PAGASASource()
+        grid = np.ones((2, 2), dtype=np.uint8)
+        source._frame_cache[START] = grid; source._cache_order = [START]
+        monkeypatch.setattr(mod.time, "time", lambda:START+600)
+        try:
+            assert await source.fetch_frame(REGIONS["PHCOMP"], 10) is grid
+            for date in (datetime.fromtimestamp(START, timezone.utc), datetime.fromtimestamp(START, timezone.utc).replace(tzinfo=None)):
+                assert await source.fetch_archive_frame(REGIONS["PHCOMP"], date) is grid
+            source._last_fetch_unix = START+600
+            assert await source.fetch_frame(REGIONS["PHCOMP"], 0) is None
+            assert await source.fetch_archive_frame(REGIONS["PHCOMP"], datetime(2024, 1, 1, tzinfo=timezone.utc)) is None
+            with pytest.raises(ValueError, match="PHCOMP"):
+                await source.fetch_frame(REGIONS["MYPENINSULAR"], 0)
+        finally:
+            await source.close()

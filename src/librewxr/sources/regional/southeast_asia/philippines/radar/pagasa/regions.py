@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Joshua Kimsey
-"""Region definition for the PAGASA PANAHON Philippines radar composite.
+"""Stable geographic grid for the PAGASA PANaHON Philippines mosaic.
 
-``PHCOMP`` is the full Philippine national mosaic footprint served by the
-PANAHON web app's 2048×2048 PNG endpoint — Luzon + Visayas + Mindanao +
-W. Palawan, with edges of Sabah and N. Sulawesi.  Bounds are the
-``leftBottom`` / ``rightTop`` of the web app's composite view, taken from
-the PANAHON JS bundle.
-
-The 2048×2048 PNG covers a wider lat span (18.66°) than lon span
-(14.10°), so pixels are non-square in geographic units —
-``pixel_size_y`` captures the lat axis separately.
+Current upstream numeric PNGs use Web Mercator and variable dimensions.
+The source reprojects them to this existing 2048×2048 geographic grid;
+its unequal longitude/latitude pixel sizes and coverage stay unchanged.
 """
 from __future__ import annotations
 

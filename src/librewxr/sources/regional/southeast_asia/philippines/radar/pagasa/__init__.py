@@ -3,8 +3,9 @@
 """PAGASA PANAHON radar composite — self-contained source package.
 
 Covers the entire Philippines (Luzon + Visayas + Mindanao + W. Palawan,
-plus edges of Sabah and N. Sulawesi) via a single 2048×2048 national
-mosaic served anonymously from ``cdn.panahon.gov.ph``.  Public domain per
+plus edges of Sabah and N. Sulawesi) via numeric radar images served
+anonymously from ``panahon.gov.ph`` and reprojected to the existing
+2048×2048 geographic mosaic. Public domain per
 Philippine IP code RA 8293 §176 (government-works exception); attribution
 to PAGASA / DOST recorded in the package README.  One region rides on one
 API pair per cycle: ``PHCOMP`` in the ``SOUTHEAST_ASIA`` group, peer to

@@ -11,35 +11,56 @@ Palawan), plus edges of Sabah and northern Sulawesi. The existing
 2048×2048 geographic grid and station inventory are unchanged.
 
 The upstream numeric images use **Web Mercator**, with their longest side
-2048 pixels and an aspect ratio derived from the timeline bounds. The
+1024 pixels (matching the public viewer) and an aspect ratio derived from the timeline bounds. The
 adapter reprojects them by nearest neighbour onto PHCOMP's geographic
 grid, retaining the alpha coverage mask and avoiding blended reflectivity
 or fabricated echoes outside the image extent.
 
 ## Timeline and endpoints
 
-- `GET /api/v1/radar/timeline?sublayer=mosaic-reflectivity` returns native
-  UTC `observed_at_unix` timestamps, bounds, scale and tile version. The
-  current buffer carries nine frames at **10-minute cadence**; ingestion
-  follows the returned timestamps rather than assuming six frame indices.
-- `GET /api/v1/radar-data-image?sublayer=mosaic-reflectivity&t=TIMESTAMP&mode=dbz&size=2048&v=VERSION`
-  returns the corresponding numeric PNG. The timeline's legacy `image_url`
-  fields may be empty and are not used.
+The public [rain-rate viewer](https://panahon.gov.ph/?trg=iframe&req=radar.rain-rate),
+linked from [PAGASA's radar page](https://bagong.pagasa.dost.gov.ph/radar),
+starts an anonymous session. Its HTML supplies `csrf-token`, `embed-grant`
+and `api-sig` metadata, retained in memory alongside its cookies. No account,
+operator credentials or configured API key are required.
 
-The client identifies itself as LibreWXR, supplies the origin's normal
-Referer and Accept headers, and starts an anonymous public web session.
-When the homepage provides a CSRF token, the client forwards it with the
-session cookies, refreshing once on an expired-session response. No
-account or operator credentials are required. `LIBREWXR_PAGASA_BASE_URL` continues to support a
-custom origin or compatible mirror.
+- `GET /api/v1/radar/timeline?sublayer=mosaic-rainrate` returns native UTC
+  `observed_at_unix` timestamps, bounds, scale and tile version. The current
+  public buffer carries six frames at **10-minute cadence**; ingestion follows
+  returned timestamps rather than assuming a fixed frame count.
+- `GET /api/v1/radar-data-image?sublayer=mosaic-rainrate&t=TIMESTAMP&mode=rain&size=1024&v=VERSION`
+  returns the corresponding numeric PNG (currently 750×1024, luminance + alpha).
+  Legacy `image_url` fields may be empty and are not used.
+
+Each API request sends the CSRF token, cookies and `X-Embed-Grant`, with
+`X-Ts`, a fresh `X-Nonce` and `X-Sig`. The signature is HMAC-SHA256 using the
+public session's `api-sig` as a UTF-8 key over four newline-separated fields:
+`GET`, the request path stripped of leading/trailing slashes (no query),
+the Unix timestamp and the nonce. Even transport retries get fresh signatures.
+Signed API requests do not follow redirects.
+
+The client identifies itself as LibreWXR and uses the public viewer's Referer.
+Each coalesced refresh obtains fresh session context. One additional renewal
+is allowed for HTTP 403/419 or an entirely placeholder image window, with no
+per-image renewal storm. Session values are never included in adapter logs.
+`LIBREWXR_PAGASA_BASE_URL` still supports a custom origin or mirror implementing
+this public session flow; missing context fails without unsigned API requests.
 
 ## Numeric encoding and missing data
 
-The PNG red channel stores a normalized value; alpha marks coverage. The
-adapter applies the timeline's dBZ `scale.max` and `scale.sqrt` metadata,
-then LibreWXR's standard uint8 encoding. Display palettes have no effect
-on the decoded values. Unexpected scales, bounds, dimensions and images
-without an alpha mask are rejected.
+The PNG red/luminance channel stores a normalized rain rate; alpha marks
+coverage. Apply `scale.sqrt` (square the normalized value when true), then
+multiply by `scale.max` to obtain mm/hr. Convert to equivalent reflectivity
+using the supplied `scale.zr` coefficients: `Z = a R^b`, or
+`dBZ = 10 log10(a) + 10 b log10(R)`. Zero rain and zero alpha become no echo.
+The current advertised coefficients are `a=409.78`, `b=1.21`, with a
+square-root scale capped at 80 mm/hr; these values are read from metadata,
+not hardcoded in the decoder. This is rain-rate-derived equivalent dBZ,
+not the separate reflectivity product.
+
+LibreWXR's standard uint8 encoding is then applied. Display palettes have
+no effect on decoded values. Unexpected units, scales, coefficients,
+bounds, dimensions and images without an alpha mask are rejected.
 
 A transparent **1×1 placeholder** is unavailable imagery, not a valid dry
 radar frame. These responses are summarized in a warning and never cached

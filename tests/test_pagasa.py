@@ -2,7 +2,11 @@
 # Copyright (C) 2026 Joshua Kimsey
 """PAGASA's current numeric API, projection, missing data and cache contract."""
 import asyncio
+import hashlib
+import hmac
 import io
+import json
+from pathlib import Path
 import math
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
@@ -23,6 +27,33 @@ from librewxr.sources.regional.southeast_asia.philippines.radar.pagasa.source im
 pytestmark = pytest.mark.sources
 BOUNDS = [115.41549141305251, 3.801613036809332, 129.51730887177652, 22.45850950564088]
 START = 1794670800
+SIGNING_KEY = "public-test-signing-context-not-a-real-key" * 3
+GRANT = "public-test-embed-grant"
+VIEWER = "https://panahon.gov.ph/?trg=iframe&req=radar.rain-rate"
+
+
+def session_html(token="anonymous-test-token"):
+    return (f'<meta name="csrf-token" content="{token}">'
+            f'<meta name="embed-grant" content="{GRANT}">'
+            f'<meta name="api-sig" content="{SIGNING_KEY}">')
+
+
+def assert_signed(request):
+    timestamp = request.headers["x-ts"]
+    nonce = request.headers["x-nonce"]
+    assert timestamp.isdecimal() and len(nonce) == 32
+    assert all(c in "0123456789abcdef" for c in nonce)
+    message = f"GET\n{request.url.path.strip('/')}\n{timestamp}\n{nonce}"
+    expected = hmac.new(SIGNING_KEY.encode(), message.encode(), hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(request.headers["x-sig"], expected)
+    assert request.headers["x-embed-grant"] == GRANT
+
+
+def rain_metadata(count=6):
+    data = metadata(count)
+    data["data"]["scale"] = {"mode": "rain", "zr": {"a": 409.78, "b": 1.21},
+                              "max": 80, "sqrt": True, "unit": "mm/hr"}
+    return data
 
 
 def metadata(count=9, start=START):
@@ -55,8 +86,10 @@ def client_source(handler):
     source = PAGASASource()
     def public_session(request):
         if request.url.path == "/":
-            return httpx.Response(200, text='<meta name="csrf-token" content="anonymous-test-token">',
+            assert str(request.url) == VIEWER
+            return httpx.Response(200, text=session_html(),
                                   headers={"Set-Cookie": "pagasa_test=anonymous; Path=/"})
+        assert_signed(request)
         return handler(request)
     source._client = httpx.AsyncClient(transport=httpx.MockTransport(public_session))
     return source
@@ -92,12 +125,12 @@ class TestRegionAndSettings:
     def test_custom_origin_is_respected(self):
         source = PAGASASource("https://mirror.example/radar/")
         spec = _image_spec(metadata()["data"])
-        assert source._timeline_url == "https://mirror.example/radar/api/v1/radar/timeline?sublayer=mosaic-reflectivity"
+        assert source._timeline_url == "https://mirror.example/radar/api/v1/radar/timeline?sublayer=mosaic-rainrate"
         url = urlsplit(source._image_url(START, spec))
         assert url.path == "/radar/api/v1/radar-data-image"
         assert parse_qs(url.query) == {
-            "sublayer": ["mosaic-reflectivity"], "t": [str(START)],
-            "mode": ["dbz"], "size": ["2048"], "v": ["5"],
+            "sublayer": ["mosaic-rainrate"], "t": [str(START)],
+            "mode": ["dbz"], "size": ["1024"], "v": ["5"],
         }
 
     def test_davao_station_is_preserved(self):
@@ -110,9 +143,9 @@ class TestMetadata:
         width, height = spec.dimensions
         xspan = math.radians(BOUNDS[2] - BOUNDS[0])
         yspan = math.asinh(math.tan(math.radians(BOUNDS[3]))) - math.asinh(math.tan(math.radians(BOUNDS[1])))
-        assert height == 2048
-        assert width == math.floor(2048 * xspan / yspan + .5)
-        assert width != round(2048 * (BOUNDS[2] - BOUNDS[0]) / (BOUNDS[3] - BOUNDS[1]))
+        assert height == 1024
+        assert width == math.floor(1024 * xspan / yspan + .5)
+        assert width != round(1024 * (BOUNDS[2] - BOUNDS[0]) / (BOUNDS[3] - BOUNDS[1]))
 
     @pytest.mark.parametrize("key,value", [
         ("bounds", None), ("bounds", [1, 2, 3]), ("bounds", [3, 2, 1, 4]),
@@ -201,12 +234,13 @@ class TestRefresh:
             nonlocal sessions, timelines
             if request.url.path == "/":
                 sessions += 1
-                return httpx.Response(200, text=f"<meta content='token{sessions}' name='csrf-token'>",
+                return httpx.Response(200, text=session_html(f"token{sessions}"),
                                       headers={"Set-Cookie": f"session={sessions}; Path=/"})
+            assert_signed(request)
             timelines += 1
             assert request.url.params["token"] == f"token{sessions}"
             assert request.headers["cookie"] == f"session={sessions}"
-            assert request.url.params["sublayer"] == "mosaic-reflectivity"
+            assert request.url.params["sublayer"] == "mosaic-rainrate"
             return httpx.Response(419) if timelines == 1 else httpx.Response(200, json=metadata(0))
         source = PAGASASource()
         source._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -215,21 +249,21 @@ class TestRefresh:
             assert sessions == timelines == 2
             source._last_fetch_unix = 0
             await source._refresh()
-            assert sessions == 2 and timelines == 3
+            assert sessions == 3 and timelines == 3
         finally:
             await source.close()
 
-    async def test_tokenless_compatible_mirror_is_supported(self):
+    async def test_missing_public_session_does_not_send_unsigned_requests(self, caplog):
         def handler(request):
             if request.url.path == "/":
                 return httpx.Response(404)
-            assert "token" not in request.url.params
-            return httpx.Response(200, json=metadata(0))
+            pytest.fail("unsigned API request must not be sent")
         source = PAGASASource()
         source._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
             await source._refresh()
             assert not source._cache_order
+            assert "complete session context" in caplog.text
         finally:
             await source.close()
 
@@ -239,11 +273,11 @@ class TestRefresh:
         body = image(spec)
         seen = []
         def handler(request):
-            assert request.headers["referer"] == "https://panahon.gov.ph/"
+            assert request.headers["referer"] == VIEWER
             assert request.headers["user-agent"].startswith("LibreWXR")
             assert request.url.params["token"] == "anonymous-test-token"
             assert request.headers["cookie"] == "pagasa_test=anonymous"
-            assert request.url.params["sublayer"] == "mosaic-reflectivity"
+            assert request.url.params["sublayer"] == "mosaic-rainrate"
             if request.url.path.endswith("/timeline"):
                 return httpx.Response(200, json=data)
             seen.append(int(request.url.params["t"]))
@@ -407,5 +441,171 @@ class TestLookup:
             assert await source.fetch_archive_frame(REGIONS["PHCOMP"], datetime(2024, 1, 1, tzinfo=timezone.utc)) is None
             with pytest.raises(ValueError, match="PHCOMP"):
                 await source.fetch_frame(REGIONS["MYPENINSULAR"], 0)
+        finally:
+            await source.close()
+
+
+class TestPublicRainRate:
+    @pytest.mark.parametrize("field,value", [
+        ("unit", "in/hr"), ("unit", None), ("zr", None), ("zr", {}),
+        ("zr", {"a": 0, "b": 1.21}), ("zr", {"a": 409.78, "b": -1}),
+        ("zr", {"a": True, "b": 1.21}), ("zr", {"a": 409.78, "b": float("nan")}),
+    ])
+    def test_rejects_unknown_rain_units_or_coefficients(self, field, value):
+        data = rain_metadata()["data"]
+        data["scale"][field] = value
+        with pytest.raises(ValueError):
+            _image_spec(data)
+
+    @pytest.mark.parametrize("sqrt", [False, True])
+    def test_rain_to_equivalent_dbz_uses_supplied_zr(self, small_region, sqrt):
+        spec = _ImageSpec((1, 30, 4, 60), 60, sqrt, 5, 128, "rain", (200, 1.6))
+        for value in (0, 1, 128, 255):
+            decoded = _decode_numeric_png(image(spec, value), spec, small_region)
+            rain = 60 * (value/255)**(2 if sqrt else 1)
+            expected = 0 if rain == 0 else int(np.clip((10*math.log10(200) + 16*math.log10(rain) + 32)*2, 0, 255))
+            assert np.all(decoded == expected)
+        assert not _decode_numeric_png(image(spec, 255, alpha=0), spec, small_region).any()
+
+    async def test_real_public_la_image_and_signed_flow(self):
+        fixture = Path(__file__).parent / "fixtures" / "pagasa"
+        captured = json.loads((fixture / "rainrate.json").read_text())
+        data = rain_metadata(1)
+        data["data"].update(captured["metadata"])
+        data["data"]["timeline"] = [{"observed_at_unix": captured["timestamp"]}]
+        body = (fixture / "rainrate.png").read_bytes()
+        native = np.asarray(Image.open(io.BytesIO(body)))
+        assert native.shape == (1024, 750, 2)
+        def handler(request):
+            if request.url.path.endswith("/timeline"):
+                return httpx.Response(200, json=data)
+            assert request.url.params["mode"] == "rain"
+            assert request.url.params["size"] == "1024"
+            assert int(request.url.params["t"]) == captured["timestamp"]
+            return httpx.Response(200, content=body)
+        source = client_source(handler)
+        try:
+            await source._refresh()
+            grid = source._frame_cache[captured["timestamp"]]
+            assert grid.shape == (2048, 2048) and grid.dtype == np.uint8
+            # Independent scalar check of a wet pixel's location and value:
+            # convert its Mercator centre to the nearest geographic grid node.
+            row, col = np.unravel_index(np.argmax(np.where(native[..., 1] > 0, native[..., 0], 0)), native.shape[:2])
+            west, _, east, north = BOUNDS
+            resolution = math.radians(east - west) / native.shape[1]
+            lon = west + math.degrees((col + .5) * resolution)
+            y = math.asinh(math.tan(math.radians(north))) - (row + .5) * resolution
+            lat = math.degrees(math.atan(math.sinh(y)))
+            region = REGIONS["PHCOMP"]
+            target_x = round((lon-region.west)/region.pixel_size)
+            target_y = round((region.north-lat)/region._ps_y)
+            rain = 80 * (int(native[row, col, 0])/255)**2
+            expected = int((10*math.log10(409.78) + 12.1*math.log10(rain) + 32)*2)
+            assert grid[target_y, target_x] == expected
+            assert np.count_nonzero(grid) > 1000
+            assert np.count_nonzero(grid == 0) > grid.size * .95
+        finally:
+            await source.close()
+
+    async def test_transport_retry_uses_new_nonce_and_does_not_follow_redirects(self, monkeypatch, caplog):
+        monkeypatch.setattr(mod.settings, "download_retries", 1)
+        nonces = []
+        async def no_sleep(_):
+            pass
+        monkeypatch.setattr(mod.asyncio, "sleep", no_sleep)
+        def handler(request):
+            nonces.append(request.headers["x-nonce"])
+            if len(nonces) == 1:
+                raise httpx.ReadError("response lost", request=request)
+            return httpx.Response(302, headers={"Location": "https://elsewhere.example/private"})
+        source = client_source(handler)
+        try:
+            await source._refresh()
+            assert len(nonces) == len(set(nonces)) == 2
+            assert "status=302" in caplog.text
+            for secret in (SIGNING_KEY, GRANT, "anonymous-test-token"):
+                assert secret not in caplog.text
+        finally:
+            await source.close()
+
+    @pytest.mark.parametrize("failure", ["placeholder", "HTTP 403", "HTTP 419"])
+    async def test_image_session_renewal_is_bounded_and_recovers(self, failure):
+        sessions = requests = 0
+        payload = rain_metadata(2)
+        body = image(_image_spec(payload["data"]), 128)
+        placeholder = png(np.zeros((1, 1, 4), dtype=np.uint8))
+        def handler(request):
+            nonlocal sessions, requests
+            if request.url.path == "/":
+                sessions += 1
+                return httpx.Response(200, text=session_html())
+            assert_signed(request)
+            if request.url.path.endswith("/timeline"):
+                return httpx.Response(200, json=payload)
+            requests += 1
+            if sessions == 1:
+                return (httpx.Response(200, content=placeholder) if failure == "placeholder"
+                        else httpx.Response(int(failure.split()[1])))
+            return httpx.Response(200, content=body)
+        source = PAGASASource()
+        source._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            await source._refresh()
+            assert sessions == 2 and requests == 4 and len(source._cache_order) == 2
+        finally:
+            await source.close()
+
+    async def test_persistent_placeholder_renews_only_once(self):
+        sessions = requests = 0
+        placeholder = png(np.zeros((1, 1, 4), dtype=np.uint8))
+        def handler(request):
+            nonlocal sessions, requests
+            if request.url.path == "/":
+                sessions += 1
+                return httpx.Response(200, text=session_html())
+            if request.url.path.endswith("/timeline"):
+                return httpx.Response(200, json=rain_metadata(2))
+            requests += 1
+            return httpx.Response(200, content=placeholder)
+        source = PAGASASource()
+        source._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            await source._refresh()
+            assert sessions == 2 and requests == 4 and not source._frame_cache
+        finally:
+            await source.close()
+
+    async def test_partial_gap_does_not_renew_session(self):
+        sessions = 0
+        payload = rain_metadata(2)
+        valid = image(_image_spec(payload["data"]))
+        placeholder = png(np.zeros((1, 1, 4), dtype=np.uint8))
+        def handler(request):
+            nonlocal sessions
+            if request.url.path == "/":
+                sessions += 1
+                return httpx.Response(200, text=session_html())
+            if request.url.path.endswith("/timeline"):
+                return httpx.Response(200, json=payload)
+            return httpx.Response(200, content=valid if int(request.url.params["t"]) == START else placeholder)
+        source = PAGASASource()
+        source._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            await source._refresh()
+            assert sessions == 1 and source._cache_order == [START]
+        finally:
+            await source.close()
+
+    async def test_incomplete_context_clears_stale_signing_values(self):
+        source = client_source(lambda request: httpx.Response(200, json=metadata(0)))
+        client = await source._get_client()
+        await source._prepare_session(client)
+        assert source._session_ready
+        await source.close()
+        source._client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, text='<meta name="csrf-token" content="token-only">')))
+        try:
+            assert not await source._prepare_session(source._client, force=True)
+            assert source._session_token is source._embed_grant is source._signing_key is None
         finally:
             await source.close()

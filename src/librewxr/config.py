@@ -268,8 +268,9 @@ class Settings(BaseSettings):
     mmd_publish_lag_sec: int = 600
     # PAGASA (Philippine Atmospheric, Geophysical and Astronomical
     # Services Administration) PANaHON radar mosaic via the anonymous
-    # origin JSON/numeric-PNG API. Native timestamps are currently 10 min
-    # apart; Web Mercator images are reprojected to the PHCOMP grid.
+    # public rain-rate flow (anonymous signed JSON/numeric-PNG requests).
+    # Native timestamps are currently 10 min apart; rates are converted to
+    # equivalent dBZ and Web Mercator images reprojected to PHCOMP.
     # Public domain license per Philippine IP code
     # RA 8293 §176; attribution to PAGASA in README.
     pagasa_base_url: str = "https://panahon.gov.ph"

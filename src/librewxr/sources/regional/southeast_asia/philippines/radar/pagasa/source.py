@@ -2,8 +2,8 @@
 # Copyright (C) 2026 Joshua Kimsey
 """PAGASA PANaHON numeric radar mosaic (Philippines).
 
-The public timeline supplies UTC timestamps, geographic bounds and a dBZ
-scale. Its data PNGs contain values in red and coverage in alpha, on a
+The public timeline supplies UTC timestamps, geographic bounds and a rain-rate
+scale with Z–R coefficients. Its data PNGs contain values in red and coverage in alpha, on a
 Web Mercator raster. Decode values directly and reproject to the existing
 PHCOMP geographic grid; the web client's display palette is irrelevant.
 """
@@ -12,38 +12,43 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+import hashlib
+import hmac
 import io
 import logging
 import math
+import secrets
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 import numpy as np
 from PIL import Image
 
+from librewxr.config import settings
 from librewxr.data.regions import RegionDef
 from librewxr.data.retry import retry_get
 from librewxr.sources._helpers import _dbz_float_to_uint8
 from .regions import PHCOMP
 
 logger = logging.getLogger(__name__)
-_IMAGE_SIZE = 2048
+_IMAGE_SIZE = 1024
 _MAX_NEAREST_OFFSET_SEC = 300
-_LAYER = "mosaic-reflectivity"
+_LAYER = "mosaic-rainrate"
 
 
 class _SessionTokenParser(HTMLParser):
     def __init__(self):
         super().__init__()
-        self.token = None
+        self.values = {}
 
     def handle_starttag(self, tag, attrs):
         attributes = dict(attrs)
         token = attributes.get("content")
-        if (tag == "meta" and attributes.get("name") == "csrf-token"
+        name = attributes.get("name")
+        if (tag == "meta" and name in ("csrf-token", "embed-grant", "api-sig")
                 and token and len(token) <= 1024):
-            self.token = token
+            self.values[name] = token
 
 
 def _mercator_y(latitude):
@@ -57,6 +62,8 @@ class _ImageSpec:
     sqrt: bool
     version: int
     size: int = _IMAGE_SIZE
+    mode: str = "dbz"
+    zr: tuple[float, float] | None = None
 
     @property
     def dimensions(self) -> tuple[int, int]:
@@ -83,8 +90,18 @@ def _image_spec(data: dict) -> _ImageSpec:
             and -85.051129 < south < north < 85.051129):
         raise ValueError("invalid radar bounds")
     scale = data.get("scale")
-    if not isinstance(scale, dict) or scale.get("mode") != "dbz":
-        raise ValueError("expected a dBZ radar scale")
+    if not isinstance(scale, dict) or scale.get("mode") not in ("dbz", "rain"):
+        raise ValueError("unsupported radar scale")
+    mode = scale["mode"]
+    zr = None
+    if mode == "rain":
+        coefficients = scale.get("zr")
+        if scale.get("unit") != "mm/hr" or not isinstance(coefficients, dict):
+            raise ValueError("rain scale lacks mm/hr units or Z-R coefficients")
+        zr = (coefficients.get("a"), coefficients.get("b"))
+        if any(isinstance(v, bool) or not isinstance(v, (int, float))
+               or not math.isfinite(v) or v <= 0 for v in zr):
+            raise ValueError("invalid radar Z-R coefficients")
     maximum = scale.get("max")
     if (isinstance(maximum, bool) or not isinstance(maximum, (int, float))
             or not math.isfinite(maximum) or not 0 < maximum <= 255):
@@ -97,8 +114,8 @@ def _image_spec(data: dict) -> _ImageSpec:
         raise ValueError("invalid radar tile version")
     sizes = data.get("image_sizes", [_IMAGE_SIZE])
     if not isinstance(sizes, list) or _IMAGE_SIZE not in sizes:
-        raise ValueError("radar no longer advertises the 2048 image size")
-    spec = _ImageSpec(bounds, float(maximum), sqrt, version, _IMAGE_SIZE)
+        raise ValueError("radar no longer advertises the 1024 image size")
+    spec = _ImageSpec(bounds, float(maximum), sqrt, version, _IMAGE_SIZE, mode, zr)
     if min(spec.dimensions) < 2:
         raise ValueError("degenerate radar image bounds")
     return spec
@@ -143,6 +160,12 @@ def _decode_numeric_png(
     if spec.sqrt:
         values *= values
     values *= np.float32(spec.maximum)
+    if spec.mode == "rain":
+        # Z = a R**b; zero rain is no echo, not zero dBZ. Only the
+        # 256-entry LUT needs floating point work, not the full raster.
+        a, b = spec.zr
+        values[1:] = 10 * math.log10(a) + 10 * b * np.log10(values[1:])
+        values[0] = -32
     lut = _dbz_float_to_uint8(values)
     red = rgba[rows[:, None], columns, 0]
     output = lut[red]
@@ -169,33 +192,66 @@ class PAGASASource:
         self._refresh_lock = asyncio.Lock()
         self._session_ready = False
         self._session_token: str | None = None
-        # The origin returns a generic image to requests without its normal
-        # site context. Identify the client honestly. The public homepage
-        # supplies an anonymous session; no login/operator credentials are used.
-        self._headers = {"User-Agent": "LibreWXR radar client", "Referer": self._base_url + "/"}
+        self._embed_grant: str | None = None
+        self._signing_key: str | None = None
+        # Follow the public viewer linked from PAGASA's radar page. Its
+        # anonymous session supplies signing context; no account is used.
+        self._viewer_url = self._base_url + "/?trg=iframe&req=radar.rain-rate"
+        self._headers = {"User-Agent": "LibreWXR radar client", "Referer": self._viewer_url}
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._session_ready = False
             self._session_token = None
+            self._embed_grant = None
+            self._signing_key = None
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True,
             )
         return self._client
 
-    async def _prepare_session(self, client, *, force=False):
+    async def _prepare_session(self, client, *, force=False) -> bool:
         if self._session_ready and not force:
-            return
-        self._session_token = None
+            return True
+        self._session_ready = False
+        self._session_token = self._embed_grant = self._signing_key = None
         response = await retry_get(
-            client, self._base_url + "/", log_name="PAGASA-session",
-            headers={**self._headers, "Accept": "text/html"},
+            client, self._viewer_url, log_name="PAGASA-session",
+            headers={"User-Agent": self._headers["User-Agent"], "Accept": "text/html"},
         )
         if response is not None and response.status_code == 200:
             parser = _SessionTokenParser()
             parser.feed(response.text)
-            self._session_token = parser.token
-        self._session_ready = True
+            values = parser.values
+            if all(values.get(name) for name in ("csrf-token", "embed-grant", "api-sig")):
+                self._session_token = values["csrf-token"]
+                self._embed_grant = values["embed-grant"]
+                self._signing_key = values["api-sig"]
+                self._session_ready = True
+        if not self._session_ready:
+            logger.warning("PAGASA public viewer did not supply complete session context")
+        return self._session_ready
+
+    async def _api_get(self, client, url, *, accept, log_name):
+        # A lost response may already have consumed the nonce. Sign every
+        # transport retry afresh, matching PANaHON's public client protocol.
+        for attempt in range(settings.download_retries + 1):
+            timestamp = str(int(time.time()))
+            nonce = secrets.token_hex(16)
+            message = f"GET\n{urlsplit(url).path.strip('/')}\n{timestamp}\n{nonce}"
+            signature = hmac.new(self._signing_key.encode(), message.encode(), hashlib.sha256).hexdigest()
+            try:
+                return await client.get(self._with_session(url), headers={
+                    **self._headers, "Accept": accept, "X-Ts": timestamp,
+                    "X-Nonce": nonce, "X-Sig": signature, "X-Embed-Grant": self._embed_grant,
+                }, follow_redirects=False)
+            except (httpx.TransportError, httpx.DecodingError):
+                if attempt < settings.download_retries:
+                    logger.debug("%s: transport/decode error, retrying", log_name)
+                    await asyncio.sleep(1)
+                else:
+                    logger.warning("%s: transport/decode error after %d retries", log_name, attempt)
+        return None
 
     def _with_session(self, url):
         if self._session_token is None:
@@ -208,7 +264,7 @@ class PAGASASource:
 
     def _image_url(self, timestamp: int, spec: _ImageSpec) -> str:
         return self._base_url + "/api/v1/radar-data-image?" + urlencode({
-            "sublayer": _LAYER, "t": timestamp, "mode": "dbz",
+            "sublayer": _LAYER, "t": timestamp, "mode": spec.mode,
             "size": spec.size, "v": spec.version,
         })
 
@@ -242,15 +298,20 @@ class PAGASASource:
                 return
             self._last_fetch_unix = time.time()
             client = await self._get_client()
-            await self._prepare_session(client)
+            # Refresh the opaque public grant once per coalesced refresh;
+            # its lifetime is not part of the published timeline metadata.
+            if not await self._prepare_session(client, force=True):
+                return
+            renewed = False
             async def timeline():
-                return await retry_get(
-                    client, self._with_session(self._timeline_url), log_name="PAGASA-timeline",
-                    headers={**self._headers, "Accept": "application/json"},
+                return await self._api_get(
+                    client, self._timeline_url, log_name="PAGASA-timeline", accept="application/json",
                 )
             response = await timeline()
             if response is not None and response.status_code in (403, 419):
-                await self._prepare_session(client, force=True)
+                renewed = True
+                if not await self._prepare_session(client, force=True):
+                    return
                 response = await timeline()
             if response is None or response.status_code != 200:
                 logger.warning("PAGASA timeline fetch failed: status=%s",
@@ -295,9 +356,8 @@ class PAGASASource:
             async def fetch_one(ts):
                 async with semaphore:
                     try:
-                        response = await retry_get(
-                            client, self._with_session(self._image_url(ts, spec)), log_name="PAGASA-image",
-                            headers={**self._headers, "Accept": "image/png"},
+                        response = await self._api_get(
+                            client, self._image_url(ts, spec), log_name="PAGASA-image", accept="image/png",
                         )
                         if response is None:
                             return ts, None, "transport error"
@@ -313,6 +373,17 @@ class PAGASASource:
                         return ts, None, reason or type(error).__name__
 
             results = await asyncio.gather(*(fetch_one(ts) for ts in timestamps))
+            # The image route can express an expired grant as a 1x1 PNG.
+            # Renew only once for an entirely placeholder window or explicit
+            # session errors, after in-flight requests finish. Partial product
+            # gaps must not trigger one session bootstrap per missing frame.
+            session_errors = {"HTTP 403", "HTTP 419", "upstream returned a 1x1 placeholder"}
+            retry_session = (all(error == "upstream returned a 1x1 placeholder" for _, _, error in results)
+                             or any(error in ("HTTP 403", "HTTP 419") for _, _, error in results))
+            if retry_session and not renewed and await self._prepare_session(client, force=True):
+                retried = await asyncio.gather(*(fetch_one(ts) for ts, _, error in results if error in session_errors))
+                replacements = {result[0]: result for result in retried}
+                results = [replacements.get(result[0], result) for result in results]
             failures = Counter()
             for timestamp, grid, error in results:
                 if grid is None:

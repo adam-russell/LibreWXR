@@ -1,0 +1,31 @@
+{
+  "source": "https://panahon.gov.ph/?trg=iframe&req=radar.rain-rate",
+  "attribution": "PAGASA / DOST",
+  "timestamp": 1794681600,
+  "metadata": {
+    "scale": {
+      "mode": "rain",
+      "zr": {
+        "a": 409.78,
+        "b": 1.21
+      },
+      "max": 80,
+      "sqrt": true,
+      "unit": "mm/hr",
+      "label": "Rain rate"
+    },
+    "bounds": [
+      115.41549141305251,
+      3.801613036809332,
+      129.51730887177652,
+      22.45850950564088
+    ],
+    "tile_version": 5,
+    "image_sizes": [
+      896,
+      1024,
+      1536,
+      2048
+    ]
+  }
+}

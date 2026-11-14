@@ -114,7 +114,7 @@ License: **JMA Public Data License v1.0** — CC-BY equivalent, explicit commerc
 
 ### Philippines — PAGASA PANAHON (PHCOMP)
 
-Reinstated 2026-08-19 (see "Reverted and removed" for history). Updated for the current PANaHON origin API: timestamp-based numeric Web Mercator PNGs, currently nine frames at 10-minute cadence, decoded using the advertised dBZ scale and reprojected onto the existing 2048×2048 geographic grid. Nine stations, SOUTHEAST_ASIA group. Missing 1×1 image placeholders are rejected.
+Reinstated 2026-08-19 (see "Reverted and removed" for history). Updated for the public PANaHON rain-rate viewer: anonymous session signing context, timestamp-based numeric Web Mercator PNGs, currently six frames at 10-minute cadence, converted to equivalent dBZ using the advertised rain-rate scale and Z–R coefficients and reprojected onto the existing 2048×2048 geographic grid. Nine stations, SOUTHEAST_ASIA group. Missing 1×1 image placeholders are rejected.
 
 ## Radar — Reverted and removed
 

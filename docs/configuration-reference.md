@@ -343,7 +343,7 @@ MET publishes each 10-min slot ~11 minutes after its real data time, so the newe
 
 ### `LIBREWXR_PAGASA_BASE_URL`
 
-Base URL for the PAGASA PANaHON radar API. The JSON timeline endpoint at `{base}/api/v1/radar/timeline?sublayer=mosaic-reflectivity` supplies UTC timestamps, bounds and dBZ scale metadata (currently nine frames at 10-minute cadence). The timestamp-based `/api/v1/radar-data-image` endpoint serves numeric Web Mercator PNGs; the adapter decodes and reprojects them onto the existing 2048×2048 PHCOMP geographic grid. Missing 1×1 image placeholders are rejected rather than stored as clear radar frames. Public domain per Philippine IP code RA 8293 §176. Only used when `PHCOMP` or the `SOUTHEAST_ASIA` group is in `LIBREWXR_ENABLED_REGIONS`.
+Base URL for the PAGASA PANaHON radar API. The public viewer at `{base}/?trg=iframe&req=radar.rain-rate` supplies anonymous cookies, CSRF token, embed grant and request-signing context; no account or configured API key is needed. Signed requests to `/api/v1/radar/timeline?sublayer=mosaic-rainrate` supply UTC timestamps, bounds and rain-rate metadata (currently six frames at 10-minute cadence). The timestamp-based `/api/v1/radar-data-image` endpoint serves numeric Web Mercator PNGs with a 1024-pixel longest side, matching the public viewer. The adapter converts rain rate to equivalent dBZ using the advertised Z–R coefficients and reprojects onto the existing 2048×2048 PHCOMP geographic grid. Compatible mirrors must supply the same public session flow. Missing 1×1 image placeholders are rejected rather than stored as clear radar frames. Public domain per Philippine IP code RA 8293 §176. Only used when `PHCOMP` or the `SOUTHEAST_ASIA` group is in `LIBREWXR_ENABLED_REGIONS`.
 
 | | |
 |---|---|

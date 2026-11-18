@@ -438,12 +438,15 @@ async def test_render_only_lifespan_yields_before_coord_warm(tmp_path, monkeypat
     monkeypatch.setattr(settings, "warm_coord_zoom", 2)
     monkeypatch.setattr(main_module, "_WARM_JITTER_MAX_S", 0.0)
 
-    warm_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    warm_started = asyncio.Event()
+    warm_finished = threading.Event()
     release_warm = threading.Event()
 
     def _blocking_warm(regions, max_zoom, tile_size=256):
-        warm_started.set()
+        loop.call_soon_threadsafe(warm_started.set)
         release_warm.wait(30)
+        warm_finished.set()
         return 0
 
     # Patch the module-level reference main.py resolves at call time.
@@ -453,27 +456,25 @@ async def test_render_only_lifespan_yields_before_coord_warm(tmp_path, monkeypat
         pass
 
     entered = asyncio.Event()
+    release_lifespan = asyncio.Event()
 
     async def _hold():
         async with main_module._render_only_lifespan(_StubApp()):
             entered.set()
-            await asyncio.sleep(0.5)
+            await release_lifespan.wait()
 
     task = asyncio.create_task(_hold())
     try:
-        # Wait for the warm to be *running* (blocked in the stub), then
-        # assert the lifespan already yielded.  If the warm were still
-        # eager/synchronous, entered would never be set while the warm is
-        # blocked and this assertion fails.
-        assert await asyncio.to_thread(warm_started.wait, 5), (
-            "coordinate warm never started"
-        )
-        assert entered.is_set(), (
-            "render-only lifespan did not yield while the coord warm was "
-            "still running"
+        # Keep the worker alive until both the warm and readiness are
+        # observable. The warm must still be blocked when readiness arrives.
+        await asyncio.wait_for(warm_started.wait(), timeout=10)
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        assert not warm_finished.is_set(), (
+            "coordinate warm finished before render-only readiness was observed"
         )
     finally:
         release_warm.set()
+        release_lifespan.set()
         await task
 
 

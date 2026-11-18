@@ -60,6 +60,14 @@ def test_warm_coord_zoom_mode_default(
     assert s.warm_coord_zoom == expected_zoom
 
 
+def test_coverage_aware_blur_can_be_disabled(monkeypatch):
+    monkeypatch.delenv("LIBREWXR_COVERAGE_AWARE_BLUR", raising=False)
+    assert Settings(_env_file=None).coverage_aware_blur is True
+
+    monkeypatch.setenv("LIBREWXR_COVERAGE_AWARE_BLUR", "false")
+    assert Settings(_env_file=None).coverage_aware_blur is False
+
+
 def test_warm_coord_zoom_explicit_zero_uses_mode_default(monkeypatch):
     # 0 is the "use mode default" sentinel, not "disabled".
     s = _fresh_settings(monkeypatch, mode="single", warm_zoom=0)

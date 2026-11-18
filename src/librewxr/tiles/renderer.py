@@ -4,6 +4,7 @@ import io
 import logging
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import cv2
@@ -12,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 from librewxr.colors.schemes import colorize, colorize_with_lut, get_lut
 from librewxr.config import settings
-from librewxr.data.coverage import sample_coverage, sample_feather
+from librewxr.data.coverage import coverage_mask_revision, sample_coverage, sample_feather
 from librewxr.data.regions import RegionDef
 from librewxr.tiles.coordinates import (
     compute_blur_radius,
@@ -21,6 +22,7 @@ from librewxr.tiles.coordinates import (
     region_pixel_indices_fractional,
     region_pixel_indices_padded,
     tile_bounds,
+    tile_pixel_latlon_axes,
     tile_pixel_latlons,
     tile_pixel_latlons_padded,
 )
@@ -100,6 +102,13 @@ class TileGeometry:
 # ---------------------------------------------------------------------------
 
 
+def blur_mode_cache_suffix(smooth: bool) -> str:
+    """Namespace smoothed tiles in the shared store by blur rule."""
+    if not smooth:
+        return ""
+    return "-blur-coverage" if settings.coverage_aware_blur else "-blur-legacy"
+
+
 def transparent_fast_path_label(
     frame_regions: dict[str, np.ndarray],
     z: int,
@@ -158,7 +167,7 @@ def _select_blur_region(
     the Gaussian from its Jacobian leaves blocky 0.04° precip edges
     unblurred.
 
-    Cost shape (the helper runs on every smoothed multi-region tile):
+    Coverage work runs on cache misses for smoothed multi-region tiles:
 
     1. Single region with data -> return it, zero coverage work.  This
        is 99%+ of tiles.
@@ -177,13 +186,30 @@ def _select_blur_region(
     if len(regions_with_data) == 1:
         return regions_with_data[0]
 
-    lats, lons = tile_pixel_latlons(z, x, y, tile_size)
+    # A render in flight during a mask replacement can only populate its old
+    # revision. Later requests use the revision of the newly installed masks.
+    return _cached_blur_region(
+        tuple(regions_with_data), z, x, y, tile_size, coverage_mask_revision(),
+    )
 
-    idx = [0, tile_size // 2, tile_size - 1]
-    probe_lats = lats[np.ix_(idx, idx)]
-    probe_lons = lons[np.ix_(idx, idx)]
+
+@lru_cache(maxsize=settings.coord_cache_size)
+def _cached_blur_region(
+    regions_with_data: tuple[RegionDef, ...],
+    z: int, x: int, y: int, tile_size: int, _coverage_revision: int,
+) -> RegionDef:
+    indices = np.arange(tile_size, dtype=np.float32)
+    lat, lon = tile_pixel_latlon_axes(z, x, y, tile_size, indices)
+    probe_indices = [0, tile_size // 2, tile_size - 1]
+    probe_lats, probe_lons = np.broadcast_arrays(
+        lat[probe_indices, None], lon[None, probe_indices],
+    )
     if sample_coverage(regions_with_data[0].name, probe_lats, probe_lons).any():
         return regions_with_data[0]
+
+    # Exact coverage still needs every pixel center, but broadcast views
+    # keep only the two axes instead of loading or caching a dense grid.
+    lats, lons = np.broadcast_arrays(lat[:, None], lon[None, :])
 
     # ``regions_with_data`` is finest-first (see ``overlapping_regions``);
     # preserve that order so the finest claimer wins.
@@ -220,7 +246,8 @@ def compute_tile_geometry(
     ``legacy_blur_donor`` forces the pre-fix blur rule (finest
     bbox-overlapping region, regardless of what its coverage claims);
     window-mode components pass it so the window stitch's max-radius
-    rule keeps sizing from the finest region overall.
+    rule keeps sizing from the finest region overall. The deployment
+    setting can also select the pre-fix rule for regular tiles.
     """
     regions = overlapping_regions(z, x, y, enabled_regions)
     regions_with_data = [r for r in regions if r.name in frame_regions]
@@ -250,14 +277,12 @@ def compute_tile_geometry(
     # A 9-point probe keeps land tiles on the status-quo path at
     # negligible cost; the exact full-core check runs only on probe-miss
     # tiles, so thin coverage wedges / islands can never be over-blurred.
-    # ``legacy_blur_donor`` preserves the old finest-bbox rule for
-    # window-mode components, whose stitch applies the max component
-    # radius to the whole canvas.
+    # Window-mode components and deployments using the legacy rule
+    # size the blur from the finest overlapping region.
     if smooth:
-        donor = (
-            regions_with_data[0] if legacy_blur_donor
-            else _select_blur_region(regions_with_data, z, x, y, tile_size)
-        )
+        donor = regions_with_data[0]
+        if settings.coverage_aware_blur and not legacy_blur_donor:
+            donor = _select_blur_region(regions_with_data, z, x, y, tile_size)
         blur_radius = compute_blur_radius(donor, z, x, y, tile_size)
     else:
         blur_radius = 0.0

@@ -138,6 +138,7 @@ class Settings(BaseSettings):
     memory_limit_mb: int = 0  # Container memory limit in MB (0 = auto-detect)
     memory_pressure_check_interval: int = 30  # Seconds between memory pressure checks
     smooth_radius: float = 1.0  # Baseline Gaussian blur radius; renderer auto-scales it up at high zoom on coarse sources
+    coverage_aware_blur: bool = True  # Size radar smoothing from the finest region that contributes coverage
     noise_floor_dbz: float = 10.0  # Minimum dBZ to display; lower values are zeroed out
     despeckle_min_neighbors: int = 3  # Min non-zero neighbors (of 8) to keep a pixel; 0 to disable
     webp_quality: int = 100  # WebP quality: 100 = lossless (default), 1-99 = lossy at that quality

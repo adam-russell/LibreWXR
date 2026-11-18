@@ -442,6 +442,14 @@ class TestBlurRegionSelection:
             regions, self._Z, self._X, self._Y, self._TILE,
         )
 
+    @pytest.fixture(autouse=True)
+    def _clear_blur_region_cache(self):
+        from librewxr.tiles.renderer import _cached_blur_region
+
+        _cached_blur_region.cache_clear()
+        yield
+        _cached_blur_region.cache_clear()
+
     def test_single_region_skips_coverage_entirely(self, monkeypatch):
         """99%+ of tiles: one region with data -> return it, no coverage."""
         from librewxr.tiles import renderer as renderer_mod
@@ -469,7 +477,9 @@ class TestBlurRegionSelection:
             return np.ones(lat.shape, dtype=bool)
 
         monkeypatch.setattr(renderer_mod, "sample_coverage", _coverage)
+        before = renderer_mod.tile_pixel_latlons.cache_info()
         assert self._select([fine, coarse]) is fine
+        assert renderer_mod.tile_pixel_latlons.cache_info() == before
         # Only the 3x3 probe ran; no full-core grid was ever sampled.
         assert calls == [("FINE", (3, 3))]
 
@@ -482,12 +492,16 @@ class TestBlurRegionSelection:
 
         def _coverage(name, lat, lon):
             calls.append((name, lat.shape))
+            assert lat.strides[1] == 0
+            assert lon.strides[0] == 0
             if name == "FINE":
                 return np.zeros(lat.shape, dtype=bool)
             return np.ones(lat.shape, dtype=bool)
 
         monkeypatch.setattr(renderer_mod, "sample_coverage", _coverage)
+        before = renderer_mod.tile_pixel_latlons.cache_info()
         assert self._select([fine, coarse]) is coarse
+        assert renderer_mod.tile_pixel_latlons.cache_info() == before
         # Probe first, then the exact full-core check finest-first.
         assert calls == [
             ("FINE", (3, 3)),
@@ -525,6 +539,64 @@ class TestBlurRegionSelection:
             lambda name, lat, lon: np.zeros(lat.shape, dtype=bool),
         )
         assert self._select([fine, coarse]) is fine
+
+
+    def test_cache_reuses_the_ordered_region_set_and_distinguishes_tile_size(self, monkeypatch):
+        from librewxr.tiles import renderer as renderer_mod
+
+        fine, coarse, extra = self._region("FINE"), self._region("COARSE", 0.04), self._region("EXTRA", 0.06)
+        monkeypatch.setattr(
+            renderer_mod, "sample_coverage",
+            lambda name, lat, lon: np.ones(lat.shape, dtype=bool),
+        )
+        cache = renderer_mod._cached_blur_region
+
+        assert self._select([fine, coarse]) is fine
+        assert self._select([fine, coarse]) is fine
+        assert cache.cache_info().hits == 1
+        assert self._select([coarse, fine]) is coarse
+        assert self._select([fine, extra]) is fine
+        assert _select_blur_region([fine, coarse], self._Z, self._X, self._Y, 512) is fine
+        assert cache.cache_info().misses == 4
+
+    def test_built_and_loaded_coverage_reselect_the_donor(self, tmp_path, monkeypatch):
+        from librewxr.data import coverage
+
+        fine, coarse = self._region("FINE"), self._region("COARSE", 0.04)
+        for region in (fine, coarse):
+            monkeypatch.setitem(coverage.REGIONS, region.name, region)
+        monkeypatch.setattr(coverage, "_COVERAGE_MASKS", {})
+        monkeypatch.setattr(coverage, "_FEATHER_MASKS", {})
+        enabled = [fine.name, coarse.name]
+        stations = {fine.name: [], coarse.name: [(35, -95)]}
+
+        coverage.build_coverage_masks(stations)
+        assert self._select([fine, coarse]) is coarse
+        coverage.build_feather_masks()
+        assert coverage.save_masks(tmp_path, enabled, stations)
+
+        coverage.build_coverage_masks({fine.name: [(35, -95)]})
+        assert self._select([fine, coarse]) is fine
+
+        assert coverage.load_masks(tmp_path, enabled, stations)
+        assert self._select([fine, coarse]) is coarse
+
+    def test_cache_is_bounded_and_cleared_under_memory_pressure(self, monkeypatch):
+        from librewxr.main import _clear_coord_caches
+        from librewxr.tiles import renderer as renderer_mod
+
+        fine, coarse = self._region("FINE"), self._region("COARSE", 0.04)
+        monkeypatch.setattr(
+            renderer_mod, "sample_coverage",
+            lambda name, lat, lon: np.ones(lat.shape, dtype=bool),
+        )
+        cache = renderer_mod._cached_blur_region
+        capacity = cache.cache_info().maxsize
+        for x in range(capacity + 1):
+            _select_blur_region([fine, coarse], 16, x, self._Y, self._TILE)
+        assert cache.cache_info().currsize == capacity
+        _clear_coord_caches()
+        assert cache.cache_info().currsize == 0
 
 
 class TestBlurDonorIntegration:
@@ -577,6 +649,9 @@ class TestBlurDonorIntegration:
         return fine, coarse, frames
 
     def test_default_donor_is_the_claiming_coarse_region(self, monkeypatch):
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "coverage_aware_blur", True)
         fine, coarse, frames = self._patch_tile(monkeypatch)
         geom = compute_tile_geometry(
             frames, self._Z, self._X, self._Y,
@@ -596,6 +671,25 @@ class TestBlurDonorIntegration:
             frames, self._Z, self._X, self._Y,
             tile_size=self._TILE, smooth=True, nwp_chain=None,
             legacy_blur_donor=True,
+        )
+        assert geom.is_transparent is False
+        assert geom.blur_radius == compute_blur_radius(
+            fine, self._Z, self._X, self._Y, self._TILE,
+        )
+
+    def test_disabling_coverage_aware_blur_uses_finest_bbox_without_probing(self, monkeypatch):
+        from librewxr.tiles import renderer as renderer_mod
+
+        fine, _, frames = self._patch_tile(monkeypatch)
+        monkeypatch.setattr(renderer_mod.settings, "coverage_aware_blur", False)
+
+        def unexpected_coverage_probe(*args):
+            pytest.fail("Legacy blur sizing should bypass the coverage probe")
+
+        monkeypatch.setattr(renderer_mod, "_select_blur_region", unexpected_coverage_probe)
+        geom = compute_tile_geometry(
+            frames, self._Z, self._X, self._Y,
+            tile_size=self._TILE, smooth=True, nwp_chain=None,
         )
         assert geom.is_transparent is False
         assert geom.blur_radius == compute_blur_radius(

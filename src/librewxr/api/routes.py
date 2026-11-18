@@ -58,6 +58,7 @@ from librewxr.tiles.coordinates import (
 from librewxr.tiles.renderer import (
     _encode_image,
     _transparent_tile,
+    blur_mode_cache_suffix,
     compute_coverage_rgba,
     compute_tile_geometry,
     present_tile,
@@ -984,8 +985,8 @@ def _shared_tile_key(timestamp, version, z, x, y, tile_size, smooth, snow, color
     """
     return (
         f"{timestamp}-v{version}-{z}-{x}-{y}-{tile_size}-"
-        f"{int(smooth)}{int(snow)}-{color}-{ext}-q{settings.webp_quality}-"
-        f"p{pal_ver}"
+        f"{int(smooth)}{int(snow)}-{color}-{ext}-q{settings.webp_quality}"
+        f"{blur_mode_cache_suffix(smooth)}-p{pal_ver}"
     )
 
 
@@ -1012,7 +1013,8 @@ def _shared_overlay_key(timestamp, frame_version, flow_version, cells_version, z
         f"{timestamp}-v{frame_version}-f{flow_version}-c{cells_version}-"
         f"{z}-{x}-{y}-{tile_size}-{int(smooth)}{int(snow)}-{color}-{ext}-"
         f"q{settings.webp_quality}-a{arrow_style}-k{cell_style}-"
-        f"g{lightning_fingerprint}-G{lightning_style or '-'}-p{pal_ver}"
+        f"g{lightning_fingerprint}-G{lightning_style or '-'}"
+        f"{blur_mode_cache_suffix(smooth)}-p{pal_ver}"
     )
 
 

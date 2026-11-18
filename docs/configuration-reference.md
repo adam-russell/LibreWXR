@@ -460,6 +460,17 @@ Baseline Gaussian blur radius applied when smoothing is enabled in the tile URL 
 
 **Recommended range:** 2.0 - 4.0. Rain Viewer used approximately 3.0.
 
+### `LIBREWXR_COVERAGE_AWARE_BLUR`
+
+When radar tile smoothing is enabled, size the blur from the finest source whose coverage reaches the tile. This can smooth coarse offshore precipitation more heavily. Set to `false` to size the blur from the finest overlapping source by bounding box, preserving the earlier smoothing rule and reducing offshore rendering work.
+
+The setting applies to image, overlay, and experimental numeric radar tiles. Centered window renders always use the bounding-box rule. Apply the setting consistently across render workers when they start.
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
+
 ### `LIBREWXR_NOISE_FLOOR_DBZ`
 
 Minimum dBZ value to display. Pixels below this threshold are made transparent. Filters out ground clutter, anomalous propagation, and weak noise.

@@ -19,6 +19,7 @@ import logging
 import math
 import os
 from pathlib import Path
+from threading import Lock
 
 import cv2
 import numpy as np
@@ -37,16 +38,33 @@ DEFAULT_RADAR_RANGE_KM = 240.0
 # much finer than the ~240 km radar range so blob edges are smooth.
 MASK_RESOLUTION_DEG = 0.05
 
+_CoverageMask = tuple[np.ndarray, float, float, float, float]
+
 # Station coverage mask cache: region name -> (mask, west, south, dx, dy)
-_COVERAGE_MASKS: dict[str, tuple[np.ndarray, float, float, float, float]] = {}
+_COVERAGE_MASKS: dict[str, _CoverageMask] = {}
+_coverage_revision = 0
+_coverage_lock = Lock()
+
+
+def coverage_mask_revision() -> int:
+    """Get the current revision for results derived from coverage masks."""
+    with _coverage_lock:
+        return _coverage_revision
+
+
+def _publish_coverage_masks(masks: dict[str, _CoverageMask], *, replace: bool) -> None:
+    global _COVERAGE_MASKS, _coverage_revision
+    with _coverage_lock:
+        _COVERAGE_MASKS = masks if replace else _COVERAGE_MASKS | masks
+        _coverage_revision += 1
 
 
 def _build_region_mask(
     region: RegionDef,
     stations: list[tuple[float, float]],
     range_km: float,
-) -> None:
-    """Build a boolean coverage mask for one region and store it.
+) -> _CoverageMask:
+    """Build a boolean coverage mask for one region.
 
     Uses an equirectangular approximation (valid for regional bboxes):
     distance ≈ sqrt((Δlat·111)² + (Δlon·111·cos(lat))²) in km.
@@ -76,18 +94,18 @@ def _build_region_mask(
         d2 = dlat_km * dlat_km + dlon_km * dlon_km
         mask |= d2 <= range_km_sq
 
-    _COVERAGE_MASKS[region.name] = (mask, west, south, dx, dy)
     logger.debug(
         "coverage mask %s: %dx%d @ %.2f° (%d stations, %.1f%% covered)",
         region.name, ny, nx, MASK_RESOLUTION_DEG, len(stations),
         100.0 * mask.mean(),
     )
+    return mask, west, south, dx, dy
 
 
 def _build_region_polygon_mask(
     region: RegionDef,
     polygon: list[tuple[float, float]] | list[list[tuple[float, float]]],
-) -> None:
+) -> _CoverageMask:
     """Build a coverage mask by rasterising a polygon over the region grid.
 
     ``polygon`` is either:
@@ -136,7 +154,6 @@ def _build_region_polygon_mask(
     cv2.fillPoly(canvas, pts, 255)
     mask = canvas > 0
 
-    _COVERAGE_MASKS[region.name] = (mask, west, south, dx, dy)
     total_verts = sum(len(r) for r in rings)
     logger.debug(
         "coverage mask %s: %dx%d @ %.2f° (polygon, %d ring(s), "
@@ -144,6 +161,7 @@ def _build_region_polygon_mask(
         region.name, ny, nx, MASK_RESOLUTION_DEG, len(rings),
         total_verts, 100.0 * mask.mean(),
     )
+    return mask, west, south, dx, dy
 
 
 def build_coverage_masks(
@@ -188,11 +206,12 @@ def build_coverage_masks(
     range_overrides = range_overrides or {}
     coverage_polygons = coverage_polygons or {}
 
+    built_masks: dict[str, _CoverageMask] = {}
     for region_name, polygon in coverage_polygons.items():
         region = REGIONS.get(region_name)
         if region is None:
             continue
-        _build_region_polygon_mask(region, polygon)
+        built_masks[region_name] = _build_region_polygon_mask(region, polygon)
 
     for region_name, stations in station_map.items():
         if region_name in coverage_polygons:
@@ -201,7 +220,10 @@ def build_coverage_masks(
         if region is None:
             continue
         range_km = range_overrides.get(region_name, DEFAULT_RADAR_RANGE_KM)
-        _build_region_mask(region, stations, range_km)
+        built_masks[region_name] = _build_region_mask(region, stations, range_km)
+
+    if built_masks:
+        _publish_coverage_masks(built_masks, replace=False)
 
 
 def sample_coverage(
@@ -559,7 +581,7 @@ def load_masks(
     if not isinstance(manifest_regions, dict) or set(manifest_regions) != expected_regions:
         return False
 
-    coverage_out: dict[str, tuple[np.ndarray, float, float, float, float]] = {}
+    coverage_out: dict[str, _CoverageMask] = {}
     feather_out: dict[str, tuple[np.ndarray, float, float, float, float]] = {}
     for region_name, info in manifest_regions.items():
         try:
@@ -600,8 +622,7 @@ def load_masks(
         coverage_out[region_name] = (coverage_mm, west, south, dx, dy)
         feather_out[region_name] = (feather_mm, west, south, dx, dy)
 
-    _COVERAGE_MASKS.clear()
-    _COVERAGE_MASKS.update(coverage_out)
+    _publish_coverage_masks(coverage_out, replace=True)
     _FEATHER_MASKS.clear()
     _FEATHER_MASKS.update(feather_out)
     logger.debug(

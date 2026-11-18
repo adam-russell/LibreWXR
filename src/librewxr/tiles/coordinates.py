@@ -640,17 +640,22 @@ def _overlapping_regions_cached(
     return result
 
 
+def tile_pixel_latlon_axes(
+    z: int, x: int, y: int, tile_size: int, pixel_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return float32 latitude and longitude axes at the given pixel centers."""
+    n = 2**z
+    centers = np.asarray(pixel_indices, dtype=np.float32) + 0.5
+    lon = (x + centers / tile_size) / n * 360.0 - 180.0
+    lat_rad = np.arctan(np.sinh(np.float32(math.pi) * (1 - 2 * (y + centers / tile_size) / n)))
+    return np.degrees(lat_rad), lon
+
+
 def _compute_tile_pixel_latlons(
     z: int, x: int, y: int, tile_size: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
     """Uncached compute body of ``tile_pixel_latlons``."""
-    n = 2**z
-    cx = np.arange(tile_size, dtype=np.float32) + 0.5
-    cy = np.arange(tile_size, dtype=np.float32) + 0.5
-
-    lon = (x + cx / tile_size) / n * 360.0 - 180.0
-    lat_rad = np.arctan(np.sinh(np.float32(math.pi) * (1 - 2 * (y + cy / tile_size) / n)))
-    lat = np.degrees(lat_rad)
+    lat, lon = tile_pixel_latlon_axes(z, x, y, tile_size, np.arange(tile_size, dtype=np.float32))
 
     lon_grid, lat_grid = np.meshgrid(lon, lat)
     lon_grid.flags.writeable = False
@@ -699,13 +704,8 @@ def _compute_tile_pixel_latlons_padded(
     z: int, x: int, y: int, tile_size: int = 256, pad: int = 8
 ) -> tuple[np.ndarray, np.ndarray]:
     """Uncached compute body of ``tile_pixel_latlons_padded``."""
-    n = 2**z
-    cx = np.arange(-pad, tile_size + pad, dtype=np.float32) + 0.5
-    cy = np.arange(-pad, tile_size + pad, dtype=np.float32) + 0.5
-
-    lon = (x + cx / tile_size) / n * 360.0 - 180.0
-    lat_rad = np.arctan(np.sinh(np.float32(math.pi) * (1 - 2 * (y + cy / tile_size) / n)))
-    lat = np.degrees(lat_rad)
+    indices = np.arange(-pad, tile_size + pad, dtype=np.float32)
+    lat, lon = tile_pixel_latlon_axes(z, x, y, tile_size, indices)
 
     lon_grid, lat_grid = np.meshgrid(lon, lat)
     lon_grid.flags.writeable = False

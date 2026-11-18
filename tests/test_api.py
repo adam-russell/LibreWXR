@@ -862,6 +862,34 @@ class TestSharedTileStoreIntegration:
         assert second.content == first.content
 
 
+@pytest.mark.parametrize("smooth", [False, True])
+def test_shared_radar_keys_follow_blur_mode(monkeypatch, smooth):
+    from librewxr.api import data_tiles
+
+    def keys():
+        return (
+            routes._shared_tile_key(123, 1, 4, 3, 6, 256, smooth, False, 2, "png"),
+            routes._shared_tile_key(123, 1, 4, 3, 6, 256, smooth, False, 2, "webp"),
+            routes._shared_overlay_key(
+                123, 1, 2, 3, 4, 3, 6, 256, smooth, False, 2, "png",
+                "light", "light",
+            ),
+            data_tiles._shared_key(123, 1, 4, 3, 6, 256, smooth, False),
+        )
+
+    monkeypatch.setattr(routes.settings, "coverage_aware_blur", True)
+    coverage_keys = keys()
+    monkeypatch.setattr(routes.settings, "coverage_aware_blur", False)
+    legacy_keys = keys()
+
+    if smooth:
+        assert all("-blur-coverage" in key for key in coverage_keys)
+        assert all("-blur-legacy" in key for key in legacy_keys)
+    else:
+        assert coverage_keys == legacy_keys
+        assert all("-blur-" not in key for key in coverage_keys)
+
+
 class TestPaletteAwareKeys:
     """Cache keys fold the applied palette version (``p<pal_ver>``)."""
 

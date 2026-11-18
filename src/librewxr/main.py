@@ -108,13 +108,15 @@ def _hold_mask_save_task(app: FastAPI, task: asyncio.Task) -> None:
 
 
 def _clear_coord_caches() -> None:
-    """Clear all coordinate LRU caches."""
+    """Clear coordinate and radar-sampling caches."""
+    from librewxr.tiles.renderer import _cached_blur_region
     from librewxr.tiles.sampling import sampling_plans
 
     for fn in ALL_CACHES:
         fn.cache_clear()
+    _cached_blur_region.cache_clear()
     sampling_plans.clear()
-    logger.info("Coordinate and sampling-plan caches cleared by memory monitor")
+    logger.info("Coordinate, blur-region, and sampling-plan caches cleared by memory monitor")
 
 
 async def _worker_pulse_loop(stop: asyncio.Event, cache_dir: Path) -> None:

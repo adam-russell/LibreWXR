@@ -13,7 +13,12 @@ from librewxr.colors import schemes
 from librewxr.config import settings
 from librewxr.tiles.cache import CachedRender
 from librewxr.tiles.data_tiles import COMPRESSION_LEVEL, MEDIA_TYPE, encode_data_tile
-from librewxr.tiles.renderer import compute_tile_geometry, TileGeometry, transparent_fast_path_label
+from librewxr.tiles.renderer import (
+    TileGeometry,
+    blur_mode_cache_suffix,
+    compute_tile_geometry,
+    transparent_fast_path_label,
+)
 from librewxr.tiles.coordinates import tile_bounds
 
 router = APIRouter(prefix="/experimental/radar-data", include_in_schema=False)
@@ -83,7 +88,7 @@ def _shared_key(timestamp, version, z, x, y, size, smooth, snow):
     # Numeric data has no palette dependency; keep its namespace distinct
     # from colored tiles and from other wire formats/compression levels.
     return (f"{timestamp}-v{version}-numeric-v1-zlib{COMPRESSION_LEVEL}-"
-            f"{z}-{x}-{y}-{size}-{int(smooth)}{int(snow)}")
+            f"{z}-{x}-{y}-{size}-{int(smooth)}{int(snow)}{blur_mode_cache_suffix(smooth)}")
 
 
 @router.get("/{timestamp}/{size}/{z}/{x}/{y}/{smooth_snow}.lwxr")

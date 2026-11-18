@@ -4,11 +4,25 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import subprocess
 import time
 import urllib.request
 
-SERVICES=Path(os.path.expanduser('~' + os.environ.get('SUDO_USER', ''))) / 'services'
+
+def _services_directory() -> Path:
+    """Use the configured directory or the invoking user's services directory."""
+    configured = os.environ.get("LIBREWXR_BENCHMARK_SERVICES_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+
+    # This benchmark runs under sudo, where Path.home() points to root's home.
+    invoking_user = os.environ.get("SUDO_USER")
+    home = Path(pwd.getpwnam(invoking_user).pw_dir) if invoking_user else Path.home()
+    return home / "services"
+
+
+SERVICES=_services_directory()
 PROJECT=SERVICES/'LibreWXR'
 PRODUCTION=['librewxr-renderer-1','librewxr-pipeline-1']
 LABEL='net.librewxr.client-coloring-benchmark'
